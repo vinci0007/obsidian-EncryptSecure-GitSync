@@ -11,8 +11,10 @@ const files = ["manifest.json", "main.js", "styles.css"];
 async function main() {
   const manifestPath = path.join(rootDir, "manifest.json");
   const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-  manifest.buildTime = new Date().toISOString();
-  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  const releaseManifest = {
+    ...manifest,
+    buildTime: new Date().toISOString(),
+  };
   const version = manifest.version;
   const pluginId = manifest.id;
   const releaseName = `${pluginId}-${version}`;
@@ -35,9 +37,9 @@ async function main() {
   await fs.rm(checksumPath, { force: true });
   await fs.mkdir(outputDir, { recursive: true });
 
-  for (const file of files) {
-    await fs.copyFile(path.join(rootDir, file), path.join(outputDir, file));
-  }
+  await fs.writeFile(path.join(outputDir, "manifest.json"), `${JSON.stringify(releaseManifest, null, 2)}\n`, "utf8");
+  await fs.copyFile(path.join(rootDir, "main.js"), path.join(outputDir, "main.js"));
+  await fs.copyFile(path.join(rootDir, "styles.css"), path.join(outputDir, "styles.css"));
 
   const zipEntries = [];
   for (const file of files) {

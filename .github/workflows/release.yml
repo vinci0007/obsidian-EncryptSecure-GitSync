@@ -3,6 +3,8 @@ name: Release Obsidian plugin
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -16,6 +18,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -31,10 +35,34 @@ jobs:
         run: |
           node -e "const fs=require('fs'); const m=require('./manifest.json'); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'id='+m.id+'\nversion='+m.version+'\ntag=v'+m.version+'\n');"
 
+      - name: Check release state
+        id: release_state
+        shell: bash
+        run: |
+          if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Build release package
+        if: steps.release_state.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: npm run release
 
+      - name: Create version tag
+        if: steps.release_state.outputs.exists == 'false' && !startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse -q --verify "refs/tags/${{ steps.meta.outputs.tag }}" >/dev/null; then
+            git tag "${{ steps.meta.outputs.tag }}"
+            git push origin "${{ steps.meta.outputs.tag }}"
+          fi
+
       - name: Upload workflow artifact
+        if: steps.release_state.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}
@@ -46,6 +74,7 @@ jobs:
             release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/styles.css
 
       - name: Publish GitHub release
+        if: steps.release_state.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}

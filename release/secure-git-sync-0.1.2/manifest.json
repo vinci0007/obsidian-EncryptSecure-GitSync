@@ -3,10 +3,10 @@
   "name": "Secure Git Sync",
   "version": "0.1.2",
   "releaseDate": "2026-06-23",
-  "buildTime": "2026-07-03T09:39:19.161Z",
   "minAppVersion": "1.5.0",
-  "description": "Password-confirmed Git push and pull with optional note-only encryption.",
+  "description": "Password-confirmed Git sync with optional encrypted remote note snapshots.",
   "author": "",
   "authorUrl": "",
-  "isDesktopOnly": true
+  "isDesktopOnly": true,
+  "buildTime": "2026-07-03T13:22:58.820Z"
 }

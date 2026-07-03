@@ -1,5 +1,7 @@
 node_modules/
 .tmp-real-sync-smoke/
+main.js
+*.map
 
 *.log
 .DS_Store
