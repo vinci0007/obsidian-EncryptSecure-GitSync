@@ -1,0 +1,60 @@
+name: Release Obsidian plugin
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read plugin metadata
+        id: meta
+        run: |
+          node -e "const fs=require('fs'); const m=require('./manifest.json'); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'id='+m.id+'\nversion='+m.version+'\ntag=v'+m.version+'\n');"
+
+      - name: Build release package
+        run: npm run release
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}
+          path: |
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}.zip
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}.sha256
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/manifest.json
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/main.js
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/styles.css
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Secure Git Sync ${{ steps.meta.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}.zip
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}.sha256
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/manifest.json
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/main.js
+            release/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.version }}/styles.css

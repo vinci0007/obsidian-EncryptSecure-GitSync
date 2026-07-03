@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-secure-git-sync",
+  "version": "0.1.2",
+  "description": "Password-confirmed Git sync for Obsidian with optional note-only encryption.",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "release": "node release/build-release.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "git",
+    "encryption"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.5",
+    "hash-wasm": "^4.12.0",
+    "obsidian": "^1.5.12",
+    "typescript": "^5.4.5"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "secure-git-sync",
+  "name": "Secure Git Sync",
+  "version": "0.1.2",
+  "releaseDate": "2026-06-23",
+  "buildTime": "2026-07-03T09:39:19.161Z",
+  "minAppVersion": "1.5.0",
+  "description": "Password-confirmed Git push and pull with optional note-only encryption.",
+  "author": "",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

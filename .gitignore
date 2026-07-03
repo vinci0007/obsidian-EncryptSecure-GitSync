@@ -1,0 +1,6 @@
+node_modules/
+.tmp-real-sync-smoke/
+
+*.log
+.DS_Store
+Thumbs.db
