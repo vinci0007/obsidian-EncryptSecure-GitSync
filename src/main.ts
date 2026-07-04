@@ -11,7 +11,7 @@ import {
 import { promises as fs } from "fs";
 import * as path from "path";
 import { createPasswordConfig, isUsernameRequired, randomId, rewrapPasswordConfig, shouldUpgradePasswordConfig, verifyPassword } from "./crypto";
-import { ConflictFileContent, ConflictFilePair, GitService, NoteConsistencyResult, PullResult, SyncCredential } from "./git";
+import { ConflictFileContent, ConflictFilePair, GitService, NoteConsistencyResult, PullResult, SyncCredential, validateRemoteConfig } from "./git";
 import { GitProviderClient, getProviderDefinition, PROVIDERS, ProviderRepo } from "./providers";
 import { DEFAULT_SETTINGS, DifferenceCounts, GitProgressEvent, GitProviderId, PasswordConfig, ProviderAccount, RemoteConfig, SecureGitSettings, SyncConflictResolution, SyncDifferenceSummary, UiLanguage } from "./types";
 
@@ -35,9 +35,9 @@ const TEXT = {
     passwordHint: "Password hint",
     noPasswordYet: "No administrator password has been created yet.",
     localKeyring: "Local keyring import/export",
-    localKeyringDesc: "Use a local keyring as the fallback import source. Export writes the current keyring to the same path.",
+    localKeyringDesc: "Use a local keyring as a user-selected fallback import source. Export writes the current keyring to this vault's plugin folder.",
     localKeyringPath: "Current local keyring path",
-    localKeyringPathDesc: "Import source and export target. If empty, Secure Git Sync uses keyring.json in the plugin folder.",
+    localKeyringPathDesc: "Read-only display. Use Select keyring to choose an external import source, or Clear to use the plugin folder default.",
     selectLocalKeyring: "Select keyring",
     exportLocalKeyring: "Export keyring",
     keyringExported: "Local keyring exported.",
@@ -247,9 +247,9 @@ const TEXT = {
     passwordHint: "密码提示",
     noPasswordYet: "尚未创建主管理员密码。",
     localKeyring: "本地 keyring 导入/导出",
-    localKeyringDesc: "本地 keyring 用作备用导入来源；导出会写入同一个路径。",
+    localKeyringDesc: "本地 keyring 用作用户选择的备用导入来源；导出会写入当前 vault 的插件目录。",
     localKeyringPath: "当前本地 keyring 路径",
-    localKeyringPathDesc: "作为导入来源和导出目标。留空时使用插件目录中的 keyring.json。",
+    localKeyringPathDesc: "只读显示。使用“选择 keyring”选择外部导入来源，或清空后使用插件目录默认文件。",
     selectLocalKeyring: "选择 keyring",
     exportLocalKeyring: "导出 keyring",
     keyringExported: "本地 keyring 已导出。",
@@ -620,6 +620,7 @@ export default class SecureGitSyncPlugin extends Plugin {
   }
 
   async addRemote(remote: RemoteConfig): Promise<void> {
+    validateRemoteConfig(remote);
     const existing = this.settings.remotes.find((item) => item.id === remote.id);
     if (existing) {
       Object.assign(existing, remote);
@@ -806,7 +807,7 @@ export default class SecureGitSyncPlugin extends Plugin {
       this.openPasswordSetup();
       return;
     }
-    const target = this.settings.localKeyringPath.trim() || this.defaultLocalKeyringPath();
+    const target = this.defaultLocalKeyringPath();
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, `${JSON.stringify(this.settings.password, null, 2)}\n`, "utf8");
     this.settings.localKeyringPath = target;
@@ -815,7 +816,11 @@ export default class SecureGitSyncPlugin extends Plugin {
   }
 
   private defaultLocalKeyringPath(): string {
-    return path.join(this.getVaultPath(), ".obsidian", "plugins", "obsidian-secure-git-sync", "keyring.json");
+    return path.join(this.getVaultPath(), ".obsidian", "plugins", "secure-git-sync", "keyring.json");
+  }
+
+  localKeyringDisplayPath(): string {
+    return this.settings.localKeyringPath.trim() || this.defaultLocalKeyringPath();
   }
 
   async refreshConflictState(): Promise<void> {
@@ -1205,7 +1210,9 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
     const language = this.plugin.language();
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: t(language, "settingsTitle") });
+    new Setting(containerEl)
+      .setName(t(language, "settingsTitle"))
+      .setHeading();
 
     new Setting(containerEl)
       .setName(t(language, "language"))
@@ -1247,12 +1254,9 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
       .setName(t(language, "localKeyringPath"))
       .setDesc(t(language, "localKeyringPathDesc"))
       .addText((text) => text
-        .setPlaceholder("C:\\path\\to\\keyring.json")
-        .setValue(this.plugin.settings.localKeyringPath)
-        .onChange(async (value) => {
-          this.plugin.settings.localKeyringPath = value.trim();
-          await this.plugin.saveSettings();
-        }))
+        .setPlaceholder(this.plugin.localKeyringDisplayPath())
+        .setValue(this.plugin.localKeyringDisplayPath())
+        .setDisabled(true))
       .addButton((button) => button
         .setButtonText(t(language, "selectLocalKeyring"))
         .onClick(async () => {
@@ -1283,7 +1287,9 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    containerEl.createEl("h3", { text: t(language, "manualSync") });
+    new Setting(containerEl)
+      .setName(t(language, "manualSync"))
+      .setHeading();
 
     new Setting(containerEl)
       .setName(t(language, "operations"))
@@ -1401,7 +1407,9 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    containerEl.createEl("h3", { text: t(language, "proxy") });
+    new Setting(containerEl)
+      .setName(t(language, "proxy"))
+      .setHeading();
 
     new Setting(containerEl)
       .setName(t(language, "proxyMode"))
@@ -1441,7 +1449,9 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
           }));
     }
 
-    containerEl.createEl("h3", { text: t(language, "remotes") });
+    new Setting(containerEl)
+      .setName(t(language, "remotes"))
+      .setHeading();
 
     for (const remote of this.plugin.settings.remotes) {
       new Setting(containerEl)
@@ -1488,7 +1498,9 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
           }).open();
         }));
 
-    containerEl.createEl("h3", { text: t(language, "providerAccounts") });
+    new Setting(containerEl)
+      .setName(t(language, "providerAccounts"))
+      .setHeading();
 
     for (const account of this.plugin.settings.providerAccounts) {
       new Setting(containerEl)
@@ -2455,8 +2467,13 @@ class RemoteModal extends Modal {
             new Notice(t(this.language, "remoteFieldsRequired"));
             return;
           }
-          await this.onSubmit(this.remote);
-          this.close();
+          try {
+            validateRemoteConfig(this.remote);
+            await this.onSubmit(this.remote);
+            this.close();
+          } catch (error) {
+            new Notice(formatError(error));
+          }
         }));
   }
 }
@@ -2604,7 +2621,7 @@ class RepositoryBrowserModal extends Modal {
           this.selectedRepoId = value;
           const repo = this.selectedRepo();
           this.branch = repo?.defaultBranch || this.branch;
-          this.remoteName = repo?.name || this.remoteName;
+          this.remoteName = safeRemoteName(repo?.name || this.remoteName);
         });
       });
 
@@ -2623,7 +2640,9 @@ class RepositoryBrowserModal extends Modal {
           await this.addRepo(repo);
         }));
 
-    this.contentEl.createEl("h3", { text: t(this.language, "createRepo") });
+    new Setting(this.contentEl)
+      .setName(t(this.language, "createRepo"))
+      .setHeading();
 
     new Setting(this.contentEl)
       .setName(t(this.language, "repoName"))
@@ -2659,7 +2678,7 @@ class RepositoryBrowserModal extends Modal {
   private renderRemoteFields(): void {
     const repo = this.selectedRepo();
     if (repo) {
-      this.remoteName = this.remoteName || repo.name;
+      this.remoteName = this.remoteName || safeRemoteName(repo.name);
       this.branch = this.branch || repo.defaultBranch;
     }
 
@@ -2687,14 +2706,19 @@ class RepositoryBrowserModal extends Modal {
   private async addRepo(repo: ProviderRepo): Promise<void> {
     const remote: RemoteConfig = {
       id: randomId(),
-      name: this.remoteName || repo.name,
+      name: safeRemoteName(this.remoteName || repo.name),
       url: this.account.defaultRemoteUrlType === "ssh" ? repo.sshUrl : repo.cloneUrl,
       branch: this.branch || repo.defaultBranch || "main",
       providerAccountId: this.account.id,
     };
-    await this.onAddRemote(remote);
-    new Notice(`${t(this.language, "addedRemote")} ${remote.name}.`);
-    this.close();
+    try {
+      validateRemoteConfig(remote);
+      await this.onAddRemote(remote);
+      new Notice(`${t(this.language, "addedRemote")} ${remote.name}.`);
+      this.close();
+    } catch (error) {
+      new Notice(formatError(error));
+    }
   }
 }
 
@@ -2705,6 +2729,11 @@ function addPasswordField(containerEl: HTMLElement, name: string, onChange: (val
       text.inputEl.type = "password";
       text.onChange(onChange);
     });
+}
+
+function safeRemoteName(value: string): string {
+  const normalized = value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 64);
+  return normalized && !normalized.startsWith("-") ? normalized : "origin";
 }
 
 function openExternalUrl(url: string): void {

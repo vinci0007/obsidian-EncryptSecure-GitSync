@@ -80,7 +80,7 @@ release/secure-git-sync-<version>.zip
 release/secure-git-sync-<version>.sha256
 ```
 
-GitHub Actions 发布自动化位于 `.github/workflows/release.yml`。它可手动触发，也可由 `v*` 标签触发，或在 `main` 分支插件版本变动后自动触发。Action 会构建发布包，并在 `v<manifest.version>` 对应 release 不存在时发布 GitHub Release。
+GitHub Actions 发布自动化位于 `.github/workflows/release.yml`。它可手动触发，也可由 `x.x.x` 版本标签（例如 `0.1.2`）触发，或在 `main` 分支插件版本变动后自动触发。Action 会构建发布包，并在 `<manifest.version>` 对应 release 不存在时发布 GitHub Release。
 
 ## 安装
 

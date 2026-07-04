@@ -179,15 +179,20 @@ async function timed<T>(phase: GitProgressEvent["phase"], message: string, fn: (
 }
 
 export class GitService {
-  constructor(private readonly vaultPath: string) {}
+  private readonly vaultPath: string;
+
+  constructor(vaultPath: string) {
+    this.vaultPath = path.resolve(vaultPath);
+  }
 
   async ensureRepository(): Promise<void> {
-    if (!(await exists(path.join(this.vaultPath, ".git")))) {
+    if (!(await exists(resolveVaultPath(this.vaultPath, ".git")))) {
       await this.git(["init"]);
     }
   }
 
   async ensureRemote(remote: RemoteConfig): Promise<void> {
+    validateRemoteConfig(remote);
     await this.ensureRepository();
     const remotes = (await this.gitText(["remote"])).split(/\r?\n/).filter(Boolean);
     if (remotes.includes(remote.name)) {
@@ -362,6 +367,7 @@ export class GitService {
     key: CryptoKey | null,
     onProgress?: ProgressFn,
   ): Promise<NoteConsistencyResult> {
+    validateRemoteConfig(remote);
     if (!settings.encryptionEnabled) {
       return { ...emptyDifferenceSummary().notes, consistent: true, localNotes: 0, remoteNotes: 0 };
     }
@@ -699,7 +705,7 @@ export class GitService {
       if (removed.has(file)) {
         continue;
       }
-      const localPath = path.join(this.vaultPath, file);
+      const localPath = resolveVaultPath(this.vaultPath, file);
       if (!(await exists(localPath))) {
         continue;
       }
@@ -752,7 +758,7 @@ export class GitService {
     let mergedFiles = 0;
     let conflictCopies = 0;
     for (const item of protectedFiles) {
-      const remotePath = path.join(this.vaultPath, item.file);
+      const remotePath = resolveVaultPath(this.vaultPath, item.file);
       const remoteBytes = await exists(remotePath) ? await fs.readFile(remotePath) : Buffer.alloc(0);
       if (item.category === "plugins") {
         await writeFileInRoot(this.vaultPath, item.file, item.contents);
@@ -783,13 +789,13 @@ export class GitService {
   }
 
   private async saveDirectoryConflictCopy(file: string): Promise<void> {
-    const sourceRoot = path.join(this.vaultPath, file);
+    const sourceRoot = resolveVaultPath(this.vaultPath, file);
     const timestamp = conflictTimestamp();
     const conflictRoot = `${CONFLICTS_DIR}/${timestamp}/${conflictCategoryForPath(file)}/local/${file}`;
     const files: string[] = [];
     await walk(sourceRoot, "", files, () => true);
     for (const child of files) {
-      await writeFileInRoot(this.vaultPath, `${conflictRoot}/${child}`, await fs.readFile(path.join(sourceRoot, child)));
+      await writeFileInRoot(this.vaultPath, `${conflictRoot}/${child}`, await fs.readFile(resolveVaultPath(sourceRoot, child)));
     }
   }
 
@@ -799,7 +805,7 @@ export class GitService {
       return false;
     }
     try {
-      const stat = await fs.stat(path.join(this.vaultPath, file));
+      const stat = await fs.stat(resolveVaultPath(this.vaultPath, file));
       return remoteTime > stat.mtimeMs;
     } catch {
       return true;
@@ -829,7 +835,7 @@ export class GitService {
   private async latestLocalSelfPluginRuntimeTime(): Promise<number> {
     let latest = 0;
     for (const file of selfPluginRuntimePaths()) {
-      const localPath = path.join(this.vaultPath, file);
+      const localPath = resolveVaultPath(this.vaultPath, file);
       if (await exists(localPath)) {
         latest = Math.max(latest, (await fs.stat(localPath)).mtimeMs);
       }
@@ -851,7 +857,7 @@ export class GitService {
     let latest = 0;
     const files = (await collectSyncablePluginFiles(this.vaultPath)).filter((file) => pluginDirFromPath(file) === pluginDir);
     for (const file of files) {
-      const localPath = path.join(this.vaultPath, file);
+      const localPath = resolveVaultPath(this.vaultPath, file);
       if (await exists(localPath)) {
         latest = Math.max(latest, (await fs.stat(localPath)).mtimeMs);
       }
@@ -891,7 +897,7 @@ export class GitService {
       await timed("crypto", `encrypt ${noteFiles.length} note files`, async () => {
         for (const file of noteFiles) {
           const now = new Date().toISOString();
-          const absolutePath = path.join(this.vaultPath, file);
+          const absolutePath = resolveVaultPath(this.vaultPath, file);
           const [plain, stat] = await Promise.all([fs.readFile(absolutePath), fs.stat(absolutePath)]);
           const changedAt = new Date(stat.mtimeMs).toISOString();
           const hash = sha256Hex(plain);
@@ -1066,6 +1072,7 @@ export class GitService {
   }
 
   private async fetchRemoteBranch(tempRepo: string, remote: RemoteConfig, authEnv?: NodeJS.ProcessEnv): Promise<boolean> {
+    validateRemoteConfig(remote);
     if (await this.tryGitAt(tempRepo, ["fetch", "--filter=blob:none", remote.name, remote.branch], authEnv)) {
       return true;
     }
@@ -1118,7 +1125,7 @@ export class GitService {
     const oidMap = await this.localBlobOidMap(files);
     const obsidianFiles: Record<string, PlaintextSnapshotFile> = {};
     for (const file of files.sort()) {
-      const stat = await fs.stat(path.join(this.vaultPath, file));
+      const stat = await fs.stat(resolveVaultPath(this.vaultPath, file));
       obsidianFiles[file] = {
         oid: oidMap.get(file) ?? "",
         size: stat.size,
@@ -1161,7 +1168,7 @@ export class GitService {
       if (remote && remote.oid === local.oid && remote.size === local.size) {
         await this.addExistingBlobToIndex(tempRepo, file, remote.oid);
       } else {
-        await this.addNewBlobToIndex(tempRepo, file, await fs.readFile(path.join(this.vaultPath, file)));
+        await this.addNewBlobToIndex(tempRepo, file, await fs.readFile(resolveVaultPath(this.vaultPath, file)));
       }
     }
   }
@@ -1182,7 +1189,7 @@ export class GitService {
       return null;
     }
 
-    const stat = await fs.stat(path.join(this.vaultPath, file));
+    const stat = await fs.stat(resolveVaultPath(this.vaultPath, file));
     const changedAt = new Date(stat.mtimeMs).toISOString();
     const localDoc = buildIndexedNoteDocument(localBytes, localIndex, changedAt);
     const remoteDoc = buildIndexedNoteDocument(remoteBytes, remoteIndex);
@@ -1400,7 +1407,7 @@ export class GitService {
     for (const file of localPluginFiles) {
       const pluginDir = pluginDirFromPath(file);
       if (pluginDir && remotePluginChoices.has(pluginDir) && !remoteSet.has(file)) {
-        await fs.rm(path.join(this.vaultPath, file), { force: true });
+        await fs.rm(resolveVaultPath(this.vaultPath, file), { force: true });
         removed += 1;
       }
     }
@@ -1419,7 +1426,7 @@ export class GitService {
     options: { saveConflictCopy?: boolean } = {},
   ): Promise<void> {
     const saveConflictCopy = options.saveConflictCopy !== false;
-    const localPath = path.join(this.vaultPath, file);
+    const localPath = resolveVaultPath(this.vaultPath, file);
     if (choice === "local") {
       return;
     }
@@ -1514,7 +1521,7 @@ export class GitService {
   }
 
   async listConflictDirs(): Promise<string[]> {
-    const root = path.join(this.vaultPath, CONFLICTS_DIR);
+    const root = resolveVaultPath(this.vaultPath, CONFLICTS_DIR);
     if (!(await exists(root))) {
       return [];
     }
@@ -1532,7 +1539,7 @@ export class GitService {
     for (const conflictDir of dirs) {
       for (const category of ["notes", "obsidian", "plugins"] as Array<keyof SyncConflictResolution>) {
         for (const side of ["local", "remote"] as const) {
-          const sideRoot = path.join(this.vaultPath, conflictDir, category, side);
+          const sideRoot = resolveVaultPath(this.vaultPath, normalizeVaultPath(path.join(conflictDir, category, side)));
           if (!(await exists(sideRoot))) {
             continue;
           }
@@ -1568,8 +1575,8 @@ export class GitService {
   }
 
   async readConflictFile(pair: ConflictFilePair): Promise<ConflictFileContent> {
-    const localBytes = pair.localConflictPath ? await fs.readFile(path.join(this.vaultPath, pair.localConflictPath)) : Buffer.alloc(0);
-    const remoteBytes = pair.remoteConflictPath ? await fs.readFile(path.join(this.vaultPath, pair.remoteConflictPath)) : Buffer.alloc(0);
+    const localBytes = pair.localConflictPath ? await fs.readFile(resolveVaultPath(this.vaultPath, pair.localConflictPath)) : Buffer.alloc(0);
+    const remoteBytes = pair.remoteConflictPath ? await fs.readFile(resolveVaultPath(this.vaultPath, pair.remoteConflictPath)) : Buffer.alloc(0);
     const isText = !localBytes.includes(0) && !remoteBytes.includes(0);
     return {
       ...pair,
@@ -1582,23 +1589,23 @@ export class GitService {
   async saveResolvedConflict(pair: ConflictFilePair, contents: string): Promise<void> {
     await writeFileInRoot(this.vaultPath, pair.file, Buffer.from(contents, "utf8"));
     if (pair.localConflictPath) {
-      await fs.rm(path.join(this.vaultPath, pair.localConflictPath), { force: true });
+      await fs.rm(resolveVaultPath(this.vaultPath, pair.localConflictPath), { force: true });
     }
     if (pair.remoteConflictPath) {
-      await fs.rm(path.join(this.vaultPath, pair.remoteConflictPath), { force: true });
+      await fs.rm(resolveVaultPath(this.vaultPath, pair.remoteConflictPath), { force: true });
     }
     await this.pruneEmptyConflictDirs(pair.conflictDir);
   }
 
   getConflictRootPath(): string {
-    return path.join(this.vaultPath, CONFLICTS_DIR);
+    return resolveVaultPath(this.vaultPath, CONFLICTS_DIR);
   }
 
   private async pruneConflictCopies(retentionDays: number): Promise<void> {
     if (retentionDays <= 0) {
       return;
     }
-    const root = path.join(this.vaultPath, CONFLICTS_DIR);
+    const root = resolveVaultPath(this.vaultPath, CONFLICTS_DIR);
     if (!(await exists(root))) {
       return;
     }
@@ -1610,15 +1617,15 @@ export class GitService {
       }
       const timestamp = parseConflictTimestamp(entry.name);
       if (Number.isFinite(timestamp) && timestamp < cutoff) {
-        await fs.rm(path.join(root, entry.name), { recursive: true, force: true });
+        await fs.rm(resolveVaultPath(root, entry.name), { recursive: true, force: true });
       }
     }
   }
 
   private async pruneEmptyConflictDirs(conflictDir: string): Promise<void> {
-    const conflictRoot = path.resolve(this.vaultPath, CONFLICTS_DIR);
-    let current = path.resolve(this.vaultPath, conflictDir);
-    while (current.startsWith(conflictRoot) && current !== conflictRoot) {
+    const conflictRoot = resolveVaultPath(this.vaultPath, CONFLICTS_DIR);
+    let current = resolveVaultPath(this.vaultPath, conflictDir);
+    while (isWithinRootPath(conflictRoot, current) && current !== conflictRoot) {
       const entries = await fs.readdir(current).catch(() => null);
       if (!entries || entries.length > 0) {
         return;
@@ -1629,11 +1636,11 @@ export class GitService {
   }
 
   private async moveNoteToTrash(file: string): Promise<void> {
-    const source = path.join(this.vaultPath, file);
+    const source = resolveVaultPath(this.vaultPath, file);
     if (!(await exists(source))) {
       return;
     }
-    const destination = path.join(this.vaultPath, NOTE_TRASH_DIR, conflictTimestamp(), normalizeVaultPath(file));
+    const destination = resolveVaultPath(this.vaultPath, normalizeVaultPath(path.join(NOTE_TRASH_DIR, conflictTimestamp(), normalizeVaultPath(file))));
     await fs.mkdir(path.dirname(destination), { recursive: true });
     await fs.rename(source, destination);
   }
@@ -1642,7 +1649,7 @@ export class GitService {
     if (retentionDays <= 0) {
       return;
     }
-    const root = path.join(this.vaultPath, NOTE_TRASH_DIR);
+    const root = resolveVaultPath(this.vaultPath, NOTE_TRASH_DIR);
     if (!(await exists(root))) {
       return;
     }
@@ -1654,7 +1661,7 @@ export class GitService {
       }
       const timestamp = parseConflictTimestamp(entry.name);
       if (Number.isFinite(timestamp) && timestamp < cutoff) {
-        await fs.rm(path.join(root, entry.name), { recursive: true, force: true });
+        await fs.rm(resolveVaultPath(root, entry.name), { recursive: true, force: true });
       }
     }
   }
@@ -1718,7 +1725,7 @@ export class GitService {
   }
 
   private async readPluginManifestFromLocal(pluginDir: string): Promise<PluginVersionInfo | null> {
-    const filePath = path.join(this.vaultPath, ".obsidian", "plugins", pluginDir, "manifest.json");
+    const filePath = resolveVaultPath(this.vaultPath, normalizeVaultPath(path.join(".obsidian", "plugins", pluginDir, "manifest.json")));
     if (await exists(filePath)) {
       return parsePluginVersionInfo(await fs.readFile(filePath));
     }
@@ -1747,7 +1754,7 @@ export class GitService {
   }
 
   private gitAt(cwd: string, args: string[], input: Buffer | null = null, env?: NodeJS.ProcessEnv): Promise<GitRunResult> {
-    return runGitAt(cwd, args, input, env);
+    return runGitAt(cwd, args, input, env, [this.vaultPath, os.tmpdir()]);
   }
 }
 
@@ -1758,7 +1765,7 @@ export async function collectNoteFiles(vaultPath: string): Promise<string[]> {
 }
 
 export async function collectPlaintextObsidianFiles(vaultPath: string, includePlugins = false): Promise<string[]> {
-  const obsidianPath = path.join(vaultPath, ".obsidian");
+  const obsidianPath = resolveVaultPath(vaultPath, ".obsidian");
   if (!(await exists(obsidianPath))) {
     return [];
   }
@@ -1784,7 +1791,7 @@ export async function collectPlaintextObsidianFiles(vaultPath: string, includePl
 }
 
 export async function collectSyncablePluginFiles(vaultPath: string): Promise<string[]> {
-  const pluginsPath = path.join(vaultPath, ".obsidian", "plugins");
+  const pluginsPath = resolveVaultPath(vaultPath, ".obsidian/plugins");
   if (!(await exists(pluginsPath))) {
     return [];
   }
@@ -1799,7 +1806,7 @@ async function localHashMap(root: string, files: string[]): Promise<Map<string, 
   const batchSize = 32;
   for (let index = 0; index < files.length; index += batchSize) {
     await Promise.all(files.slice(index, index + batchSize).map(async (file) => {
-      hashes.set(normalizeVaultPath(file), sha256Hex(await fs.readFile(path.join(root, file))));
+      hashes.set(normalizeVaultPath(file), sha256Hex(await fs.readFile(resolveVaultPath(root, file))));
     }));
   }
   return hashes;
@@ -1938,7 +1945,7 @@ async function walk(
   shouldInclude: (vaultRelativePath: string) => boolean,
   shouldDescend: (vaultRelativePath: string) => boolean = shouldInclude,
 ): Promise<void> {
-  const absoluteDir = path.join(root, relativeDir);
+  const absoluteDir = resolveVaultPath(root, relativeDir, true);
   const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
 
   for (const entry of entries) {
@@ -1958,7 +1965,7 @@ async function walk(
 }
 
 async function countConflictFiles(vaultPath: string): Promise<number> {
-  const root = path.join(vaultPath, CONFLICTS_DIR);
+  const root = resolveVaultPath(vaultPath, CONFLICTS_DIR);
   if (!(await exists(root))) {
     return 0;
   }
@@ -1976,16 +1983,11 @@ async function createTempGitRepo(): Promise<string> {
 }
 
 async function removeTempRepo(tempRepo: string): Promise<void> {
-  const resolvedTemp = path.resolve(tempRepo);
-  const resolvedRoot = path.resolve(os.tmpdir());
-  if (!resolvedTemp.startsWith(resolvedRoot + path.sep)) {
-    throw new Error("Refusing to remove a directory outside the system temp folder.");
-  }
-  await removeTempPathWithRetries(resolvedTemp);
+  await removeTempPathWithRetries(resolveTempPath(tempRepo));
 }
 
 async function writeFileInRoot(root: string, vaultRelativePath: string, contents: Buffer): Promise<void> {
-  const absolutePath = path.join(root, vaultRelativePath);
+  const absolutePath = resolveVaultPath(root, vaultRelativePath);
   await fs.mkdir(path.dirname(absolutePath), { recursive: true });
   await fs.writeFile(absolutePath, contents);
 }
@@ -2021,12 +2023,7 @@ async function tryMergeFileBytes(
 }
 
 async function removeTempMergeDir(tempDir: string): Promise<void> {
-  const resolvedTemp = path.resolve(tempDir);
-  const resolvedRoot = path.resolve(os.tmpdir());
-  if (!resolvedTemp.startsWith(resolvedRoot + path.sep)) {
-    throw new Error("Refusing to remove a directory outside the system temp folder.");
-  }
-  await removeTempPathWithRetries(resolvedTemp);
+  await removeTempPathWithRetries(resolveTempPath(tempDir));
 }
 
 async function removeTempPathWithRetries(target: string): Promise<void> {
@@ -2211,10 +2208,17 @@ function parseConflictTimestamp(value: string): number {
   return Date.parse(value.replace(/-(\d{3})Z$/, ".$1Z").replace(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})/, "$1T$2:$3:$4"));
 }
 
-function runGitAt(cwd: string, args: string[], input: Buffer | null = null, env?: NodeJS.ProcessEnv): Promise<GitRunResult> {
+function runGitAt(
+  cwd: string,
+  args: string[],
+  input: Buffer | null = null,
+  env?: NodeJS.ProcessEnv,
+  allowedRoots: string[] = [os.tmpdir()],
+): Promise<GitRunResult> {
+  const safeCwd = validateGitInvocation(cwd, args, allowedRoots);
   return new Promise((resolve, reject) => {
     const child = execFile("git", args, {
-      cwd,
+      cwd: safeCwd,
       env,
       windowsHide: true,
       maxBuffer: 1024 * 1024 * 50,
@@ -2237,6 +2241,43 @@ function runGitAt(cwd: string, args: string[], input: Buffer | null = null, env?
     child.stdin?.end();
   });
 }
+
+function validateGitInvocation(cwd: string, args: string[], allowedRoots: string[]): string {
+  const safeCwd = path.resolve(cwd);
+  if (!allowedRoots.some((root) => isWithinRootPath(root, safeCwd))) {
+    throw new Error("Refusing to run Git outside the vault or Secure Git Sync temporary workspace.");
+  }
+  if (args.length === 0 || !SAFE_GIT_COMMANDS.has(args[0])) {
+    throw new Error("Refusing to run an unsupported Git command.");
+  }
+  if (args.some((arg) => arg.includes("\0"))) {
+    throw new Error("Refusing to run Git with an invalid argument.");
+  }
+  return safeCwd;
+}
+
+const SAFE_GIT_COMMANDS = new Set([
+  "add",
+  "branch",
+  "checkout",
+  "commit",
+  "config",
+  "fetch",
+  "hash-object",
+  "init",
+  "log",
+  "ls-tree",
+  "merge",
+  "merge-file",
+  "pull",
+  "push",
+  "read-tree",
+  "remote",
+  "rev-parse",
+  "show",
+  "status",
+  "update-index",
+]);
 
 function parseTreeEntries(output: string): TreeEntry[] {
   return output.split("\0").filter(Boolean).map((entry) => {
@@ -2749,8 +2790,75 @@ function normalizeVaultPath(filePath: string): string {
   return normalizePath(filePath).replace(/^\/+/, "");
 }
 
+function resolveVaultPath(root: string, vaultRelativePath: string, allowRoot = false): string {
+  const normalized = normalizeVaultPath(vaultRelativePath);
+  if (!allowRoot && !normalized) {
+    throw new Error("Refusing to access an empty vault-relative path.");
+  }
+  return resolveWithinRoot(root, normalized || ".", "vault");
+}
+
+function resolveTempPath(tempPath: string): string {
+  return resolveWithinRoot(os.tmpdir(), tempPath, "system temp");
+}
+
+function resolveWithinRoot(root: string, target: string, label: string): string {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(resolvedRoot, target);
+  if (!isWithinRootPath(resolvedRoot, resolvedTarget)) {
+    throw new Error(`Refusing to access a path outside the ${label} root.`);
+  }
+  return resolvedTarget;
+}
+
+function isWithinRootPath(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function renderCommitMessage(template: string): string {
   return template.replace("{{date}}", new Date().toISOString());
+}
+
+export function validateRemoteConfig(remote: RemoteConfig): void {
+  if (!isSafeGitRemoteName(remote.name)) {
+    throw new Error("Remote name must contain only letters, numbers, dots, underscores, and hyphens.");
+  }
+  if (!isSafeGitBranchName(remote.branch)) {
+    throw new Error("Branch name must be a normal Git branch name without shell metacharacters, path traversal, or option prefixes.");
+  }
+  if (!isSafeGitRemoteUrl(remote.url)) {
+    throw new Error("Remote URL must be an HTTPS URL, SSH URL, or git@host:path SSH URL. Local filesystem remotes are not supported.");
+  }
+}
+
+function isSafeGitRemoteName(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)
+    && value !== "."
+    && value !== ".."
+    && !value.startsWith("-");
+}
+
+function isSafeGitBranchName(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value)
+    && !value.startsWith("-")
+    && !value.endsWith("/")
+    && !value.endsWith(".")
+    && !value.includes("..")
+    && !value.includes("//")
+    && !value.includes("@{")
+    && !value.includes("\\")
+    && !value.split("/").some((part) => part === "." || part === ".." || part.endsWith(".lock"));
+}
+
+function isSafeGitRemoteUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (/^https:\/\/[^\s]+$/i.test(trimmed) || /^ssh:\/\/[^\s]+$/i.test(trimmed)) {
+    return true;
+  }
+  return /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s]+$/.test(trimmed)
+    && !trimmed.includes("..")
+    && !trimmed.includes("\\");
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -2763,6 +2871,7 @@ async function exists(filePath: string): Promise<boolean> {
 }
 
 async function createGitAuthContext(remote: RemoteConfig, settings: SecureGitSettings): Promise<GitAuthContext> {
+  validateRemoteConfig(remote);
   const baseEnv = {
     ...process.env,
     ...proxyEnv(settings),
@@ -2794,14 +2903,14 @@ async function createGitAuthContext(remote: RemoteConfig, settings: SecureGitSet
   return {
     env,
     cleanup: async () => {
-      await fs.rm(askpassPath, { force: true });
+      await fs.rm(resolveTempPath(askpassPath), { force: true });
     },
   };
 }
 
 async function createAskpassScript(): Promise<string> {
   const extension = process.platform === "win32" ? ".cmd" : ".sh";
-  const askpassPath = path.join(os.tmpdir(), `secure-git-sync-askpass-${Date.now()}-${Math.random().toString(16).slice(2)}${extension}`);
+  const askpassPath = resolveTempPath(path.join(os.tmpdir(), `secure-git-sync-askpass-${Date.now()}-${Math.random().toString(16).slice(2)}${extension}`));
   const script = process.platform === "win32"
     ? [
       "@echo off",
