@@ -2139,7 +2139,7 @@ function mergeJsonValues(localValue: unknown, remoteValue: unknown): unknown {
     }
     return result;
   }
-  if (Array.isArray(localValue) && Array.isArray(remoteValue)) {
+  if (isUnknownArray(localValue) && isUnknownArray(remoteValue)) {
     const merged = [...remoteValue];
     const seen = new Set(remoteValue.map((item) => JSON.stringify(item)));
     for (const item of localValue) {
@@ -2156,6 +2156,10 @@ function mergeJsonValues(localValue: unknown, remoteValue: unknown): unknown {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
 }
 
 function canWriteConflictMarker(file: string, ...contents: Buffer[]): boolean {

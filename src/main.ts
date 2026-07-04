@@ -502,7 +502,8 @@ export default class SecureGitSyncPlugin extends Plugin {
   private lastConflictDirs: string[] = [];
 
   async onload(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loadedData: unknown = await this.loadData();
+    this.settings = { ...DEFAULT_SETTINGS, ...(isSecureGitSettings(loadedData) ? loadedData : {}) };
     this.git = new GitService(this.getVaultPath(), this.app.vault.configDir);
     await applyElectronProxy(this.settings);
 
@@ -2879,6 +2880,10 @@ function isPasswordConfig(value: unknown): value is PasswordConfig {
     && typeof config.verifierCiphertext === "string"
     && typeof config.iterations === "number"
     && (config.kdf === undefined || config.kdf === "PBKDF2-SHA-256" || config.kdf === "Argon2id");
+}
+
+function isSecureGitSettings(value: unknown): value is Partial<SecureGitSettings> {
+  return typeof value === "object" && value !== null;
 }
 
 function formatDuration(ms: number): string {

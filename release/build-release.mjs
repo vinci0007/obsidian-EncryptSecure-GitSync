@@ -11,10 +11,7 @@ const files = ["manifest.json", "main.js", "styles.css"];
 async function main() {
   const manifestPath = path.join(rootDir, "manifest.json");
   const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-  const releaseManifest = {
-    ...manifest,
-    buildTime: new Date().toISOString(),
-  };
+  const releaseManifest = { ...manifest };
   const version = manifest.version;
   const pluginId = manifest.id;
   const releaseName = `${pluginId}-${version}`;
