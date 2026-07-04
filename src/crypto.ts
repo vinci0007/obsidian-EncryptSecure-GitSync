@@ -100,7 +100,10 @@ export async function decryptFileBytes(bytes: Buffer, key: CryptoKey, vaultRelat
 
   const text = bytes.toString("utf8");
   const jsonStart = text.indexOf("\n") + 1;
-  const payload = JSON.parse(text.slice(jsonStart));
+  const payload = parseJson(text.slice(jsonStart));
+  if (!isEncryptedPayloadBody(payload)) {
+    throw new Error("Encrypted payload is invalid.");
+  }
   const plain = await crypto.subtle.decrypt(
     {
       name: "AES-GCM",
@@ -115,7 +118,7 @@ export async function decryptFileBytes(bytes: Buffer, key: CryptoKey, vaultRelat
 }
 
 export async function decryptJson<T>(bytes: Buffer, key: CryptoKey, vaultRelativePath: string): Promise<T> {
-  return JSON.parse((await decryptFileBytes(bytes, key, vaultRelativePath)).toString("utf8")) as T;
+  return parseJson<T>((await decryptFileBytes(bytes, key, vaultRelativePath)).toString("utf8"));
 }
 
 async function wrapVaultKey(username: string, password: string, hint: string, vaultKeyBytes: Uint8Array, keyId: string): Promise<PasswordConfig> {
@@ -277,6 +280,17 @@ function normalizeUsername(username: string): string {
 
 function credentialSecret(username: string, password: string): string {
   return `secure-git-sync:v3\0${username}\0${password}`;
+}
+
+function parseJson<T>(value: string): T {
+  return JSON.parse(value) as T;
+}
+
+function isEncryptedPayloadBody(value: unknown): value is { iv: string; data: string } {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as { iv?: unknown }).iv === "string"
+    && typeof (value as { data?: unknown }).data === "string";
 }
 
 function webBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {

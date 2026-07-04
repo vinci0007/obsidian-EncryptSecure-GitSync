@@ -7,7 +7,7 @@ import { normalizePath } from "obsidian";
 import { decryptFileBytes, decryptJson, encryptFileBytes, encryptJson, sha256Hex, verifyPassword } from "./crypto";
 import { DifferenceCounts, GitProviderId, GitProgressEvent, GitRunResult, NoteBlockRecord, NoteFileBlockIndex, PasswordConfig, ProviderAccount, RemoteConfig, SecureGitSettings, SyncConflictResolution, SyncDifferenceSummary } from "./types";
 
-const EXCLUDED_TOP_LEVEL = new Set([".git", ".obsidian"]);
+const EXCLUDED_TOP_LEVEL = new Set([".git"]);
 const SECURE_DIR = ".secure-git-sync";
 const MANIFEST_PATH = `${SECURE_DIR}/manifest.enc`;
 const MANIFEST_AAD = `${SECURE_DIR}/manifest`;
@@ -180,9 +180,11 @@ async function timed<T>(phase: GitProgressEvent["phase"], message: string, fn: (
 
 export class GitService {
   private readonly vaultPath: string;
+  private readonly configDir: string;
 
-  constructor(vaultPath: string) {
+  constructor(vaultPath: string, configDir: string) {
     this.vaultPath = path.resolve(vaultPath);
+    this.configDir = normalizeVaultPath(configDir);
   }
 
   async ensureRepository(): Promise<void> {
@@ -298,9 +300,10 @@ export class GitService {
   async hasLocalPlaintextChanges(includePlugins = false): Promise<boolean> {
     await this.ensureRepository();
     const commonExclusions = commonSyncPathspecExclusions();
+    const pluginsExclusion = `:(exclude)${configPath(this.configDir, "plugins")}/**`;
     const pathspecs = includePlugins
-      ? [".", ...selfPluginPathspecExclusions(), ...commonExclusions]
-      : [".", ":(exclude).obsidian/plugins/**", ...commonExclusions];
+      ? [".", ...selfPluginPathspecExclusions(this.configDir), ...commonExclusions]
+      : [".", pluginsExclusion, ...commonExclusions];
     const porcelain = await this.gitText(["status", "--porcelain", "--", ...pathspecs]);
     return porcelain.trim().length > 0;
   }
@@ -329,16 +332,16 @@ export class GitService {
       }
 
       const manifest = await timed("crypto", "decrypt remote manifest for differences", () => this.readRemoteManifest(tempRepo, key), onProgress);
-      const localNotes = await localHashMap(this.vaultPath, await collectNoteFiles(this.vaultPath));
+      const localNotes = await localHashMap(this.vaultPath, await collectNoteFiles(this.vaultPath, this.configDir));
       const remoteNotes = new Map(Object.entries(manifest.files).map(([file, entry]) => [normalizeVaultPath(file), entry.hash]));
       const notes = compareHashMaps(localNotes, remoteNotes);
 
       const localAllObsidianSnapshot = await this.localPlaintextObsidianSnapshot(true);
       const remoteAllObsidianSnapshot = await this.remotePlaintextObsidianSnapshot(tempRepo, true);
-      const localConfigSnapshot = filterPlaintextSnapshot(localAllObsidianSnapshot, isPlaintextObsidianSyncPath);
-      const remoteConfigSnapshot = filterPlaintextSnapshot(remoteAllObsidianSnapshot, isPlaintextObsidianSyncPath);
-      const localPluginSnapshot = filterPlaintextSnapshot(localAllObsidianSnapshot, isSyncablePluginPath);
-      const remotePluginSnapshot = filterPlaintextSnapshot(remoteAllObsidianSnapshot, isSyncablePluginPath);
+      const localConfigSnapshot = filterPlaintextSnapshot(localAllObsidianSnapshot, (file) => isPlaintextConfigSyncPath(file, this.configDir));
+      const remoteConfigSnapshot = filterPlaintextSnapshot(remoteAllObsidianSnapshot, (file) => isPlaintextConfigSyncPath(file, this.configDir));
+      const localPluginSnapshot = filterPlaintextSnapshot(localAllObsidianSnapshot, (file) => isSyncablePluginPath(file, this.configDir));
+      const remotePluginSnapshot = filterPlaintextSnapshot(remoteAllObsidianSnapshot, (file) => isSyncablePluginPath(file, this.configDir));
       const obsidian = comparePlaintextSnapshots(localConfigSnapshot, remoteConfigSnapshot);
       const plugins = comparePlaintextSnapshots(localPluginSnapshot, remotePluginSnapshot);
       const obsidianDecisions = await this.describeObsidianDecisions(tempRepo, localConfigSnapshot, remoteConfigSnapshot);
@@ -380,11 +383,11 @@ export class GitService {
       await this.gitAt(tempRepo, ["remote", "add", remote.name, remote.url], null, auth.env);
       const hasRemote = await timed("network", `fetch ${remote.name}/${remote.branch} for note verification`, () => this.fetchRemoteBranch(tempRepo, remote, auth.env), onProgress);
       if (!hasRemote) {
-        const localNotes = await collectNoteFiles(this.vaultPath);
+        const localNotes = await collectNoteFiles(this.vaultPath, this.configDir);
         return { localOnly: localNotes.length, remoteOnly: 0, modified: 0, samples: localNotes.slice(0, 8), consistent: localNotes.length === 0, localNotes: localNotes.length, remoteNotes: 0 };
       }
       const manifest = await timed("crypto", "decrypt remote manifest for note verification", () => this.readRemoteManifest(tempRepo, key), onProgress);
-      const localNotes = await collectNoteFiles(this.vaultPath);
+      const localNotes = await collectNoteFiles(this.vaultPath, this.configDir);
       const localNotesMap = await localHashMap(this.vaultPath, localNotes);
       const remoteNotesMap = new Map(Object.entries(manifest.files).map(([file, entry]) => [normalizeVaultPath(file), entry.hash]));
       const counts = compareHashMaps(localNotesMap, remoteNotesMap);
@@ -411,24 +414,24 @@ export class GitService {
     const decisions: string[] = [];
     for (const file of files) {
       if (decisions.length >= 40) {
-        decisions.push(`.obsidian: ${files.length - decisions.length} more files`);
+        decisions.push(`${this.configDir}: ${files.length - decisions.length} more files`);
         break;
       }
       const localFile = localFiles[file];
       const remoteFile = remoteFiles[file];
       if (localFile && !remoteFile) {
-        decisions.push(`.obsidian: keep local (local only): ${file}`);
+        decisions.push(`${this.configDir}: keep local (local only): ${file}`);
         continue;
       }
       if (!localFile && remoteFile) {
-        decisions.push(`.obsidian: use remote (remote only): ${file}`);
+        decisions.push(`${this.configDir}: use remote (remote only): ${file}`);
         continue;
       }
       if (!localFile || !remoteFile || (localFile.oid === remoteFile.oid && localFile.size === remoteFile.size)) {
         continue;
       }
       const useRemote = await this.shouldUseRemotePlaintextFile(tempRepo, file);
-      decisions.push(`.obsidian: ${useRemote ? "use remote" : "keep local"} (newer timestamp): ${file}`);
+      decisions.push(`${this.configDir}: ${useRemote ? "use remote" : "keep local"} (newer timestamp): ${file}`);
     }
     return decisions;
   }
@@ -440,14 +443,14 @@ export class GitService {
   ): Promise<string[]> {
     const localFiles = localSnapshot.obsidianFiles ?? {};
     const remoteFiles = remoteSnapshot.obsidianFiles ?? {};
-    const localDirs = pluginDirsFromSnapshot(localSnapshot);
-    const remoteDirs = pluginDirsFromSnapshot(remoteSnapshot);
+    const localDirs = pluginDirsFromSnapshot(localSnapshot, this.configDir);
+    const remoteDirs = pluginDirsFromSnapshot(remoteSnapshot, this.configDir);
     const changedDirs = new Set<string>();
     for (const file of new Set([...Object.keys(localFiles), ...Object.keys(remoteFiles)])) {
       const localFile = localFiles[file];
       const remoteFile = remoteFiles[file];
       if (!localFile || !remoteFile || localFile.oid !== remoteFile.oid || localFile.size !== remoteFile.size) {
-        const pluginDir = pluginDirFromPath(file);
+        const pluginDir = pluginDirFromPath(file, this.configDir);
         if (pluginDir) {
           changedDirs.add(pluginDir);
         }
@@ -496,7 +499,7 @@ export class GitService {
       }
       const remoteFiles = await timed("git", "list remote files for initial pull", async () => Array.from((await this.listTreeEntries(this.vaultPath, "FETCH_HEAD", ".")).keys()), onProgress);
       const remotePluginChoices = resolution.plugins === "merge"
-        ? await timed("local", "compare plugin versions for initial pull", () => this.pluginSyncChoices(this.vaultPath, remoteFiles.filter(isSyncablePluginPath)), onProgress)
+        ? await timed("local", "compare plugin versions for initial pull", () => this.pluginSyncChoices(this.vaultPath, remoteFiles.filter((file) => isSyncablePluginPath(file, this.configDir))), onProgress)
         : new Map<string, PluginSyncChoice>();
       this.reportPluginSyncChoices(remotePluginChoices, onProgress);
       const protectedLocalFiles = await timed("local", "protect local files before initial pull", () => this.protectLocalFilesBeforeInitialCheckout(remoteFiles, remotePluginChoices, resolution), onProgress);
@@ -538,12 +541,13 @@ export class GitService {
   private async commitLocalPlaintext(template: string, encryptedMode = false, includePlugins = false): Promise<void> {
     const commonExclusions = commonSyncPathspecExclusions();
     if (encryptedMode) {
+      const pluginsExclusion = `:(exclude)${configPath(this.configDir, "plugins")}/**`;
       const exclusions = includePlugins
-        ? [...selfPluginPathspecExclusions(), ...commonExclusions]
-        : [":(exclude).obsidian/plugins/**", ...commonExclusions];
+        ? [...selfPluginPathspecExclusions(this.configDir), ...commonExclusions]
+        : [pluginsExclusion, ...commonExclusions];
       await this.git(["add", "--all", "--", ".", ...exclusions]);
     } else {
-      await this.git(["add", "--all", "--", ".", ...selfPluginPathspecExclusions(), ...commonExclusions]);
+      await this.git(["add", "--all", "--", ".", ...selfPluginPathspecExclusions(this.configDir), ...commonExclusions]);
     }
     const staged = await this.gitText(["diff", "--cached", "--name-only"]);
     if (!staged.trim()) {
@@ -586,7 +590,7 @@ export class GitService {
       try {
         const localBytes = (await this.git(["show", `:2:${file}`])).stdout;
         const remoteBytes = (await this.git(["show", `:3:${file}`])).stdout;
-        await this.saveConflictCopies(file, localBytes, remoteBytes, conflictCategoryForPath(file));
+        await this.saveConflictCopies(file, localBytes, remoteBytes, conflictCategoryForPath(file, this.configDir));
         saved += 1;
       } catch {
         // Binary/submodule or incomplete conflict stage; leave Git's error path intact.
@@ -606,7 +610,7 @@ export class GitService {
       if (!localBytes && !remoteBytes) {
         continue;
       }
-      const category = conflictCategoryForPath(file);
+      const category = conflictCategoryForPath(file, this.configDir);
       const merged = await this.mergePlaintextConflictFile(file, category, localBytes, remoteBytes);
       if (merged) {
         await writeFileInRoot(this.vaultPath, file, merged);
@@ -666,7 +670,7 @@ export class GitService {
   }
 
   private async choosePluginConflictBytes(file: string, localBytes: Buffer, remoteBytes: Buffer): Promise<Buffer> {
-    const pluginDir = pluginDirFromPath(file);
+    const pluginDir = pluginDirFromPath(file, this.configDir);
     if (!pluginDir) {
       return remoteBytes;
     }
@@ -685,7 +689,7 @@ export class GitService {
   }
 
   private async readPluginManifestFromConflictStage(pluginDir: string, stage: 2 | 3): Promise<PluginVersionInfo | null> {
-    const bytes = await this.readGitStageFileBytes(`.obsidian/plugins/${pluginDir}/manifest.json`, stage);
+    const bytes = await this.readGitStageFileBytes(configPath(this.configDir, "plugins", pluginDir, "manifest.json"), stage);
     return bytes ? parsePluginVersionInfo(bytes) : null;
   }
 
@@ -717,7 +721,7 @@ export class GitService {
           protectedFiles.push({
             file,
             contents: localBytes,
-            category: conflictCategoryForPath(file),
+            category: conflictCategoryForPath(file, this.configDir),
           });
         }
       } else if (stat.isDirectory()) {
@@ -734,17 +738,17 @@ export class GitService {
     remotePluginChoices: Map<string, PluginSyncChoice>,
     resolution: SyncConflictResolution,
   ): boolean {
-    if (isSyncablePluginPath(file)) {
+    if (isSyncablePluginPath(file, this.configDir)) {
       if (resolution.plugins === "local") {
         return true;
       }
       if (resolution.plugins === "remote") {
         return false;
       }
-      const pluginDir = pluginDirFromPath(file);
+      const pluginDir = pluginDirFromPath(file, this.configDir);
       return Boolean(pluginDir && remotePluginChoices.get(pluginDir)?.useRemote === false);
     }
-    if (isPlaintextObsidianSyncPath(file)) {
+    if (isPlaintextConfigSyncPath(file, this.configDir)) {
       return resolution.obsidian !== "remote";
     }
     return resolution.notes !== "remote";
@@ -791,7 +795,7 @@ export class GitService {
   private async saveDirectoryConflictCopy(file: string): Promise<void> {
     const sourceRoot = resolveVaultPath(this.vaultPath, file);
     const timestamp = conflictTimestamp();
-    const conflictRoot = `${CONFLICTS_DIR}/${timestamp}/${conflictCategoryForPath(file)}/local/${file}`;
+    const conflictRoot = `${CONFLICTS_DIR}/${timestamp}/${conflictCategoryForPath(file, this.configDir)}/local/${file}`;
     const files: string[] = [];
     await walk(sourceRoot, "", files, () => true);
     for (const child of files) {
@@ -824,7 +828,7 @@ export class GitService {
 
   private async latestRemoteSelfPluginRuntimeTime(repoPath: string): Promise<number> {
     try {
-      const output = await this.gitTextAt(repoPath, ["log", "-1", "--format=%ct", "FETCH_HEAD", "--", ...selfPluginRuntimePaths()]);
+      const output = await this.gitTextAt(repoPath, ["log", "-1", "--format=%ct", "FETCH_HEAD", "--", ...selfPluginRuntimePaths(this.configDir)]);
       const seconds = Number.parseInt(output.trim(), 10);
       return Number.isFinite(seconds) ? seconds * 1000 : 0;
     } catch {
@@ -834,7 +838,7 @@ export class GitService {
 
   private async latestLocalSelfPluginRuntimeTime(): Promise<number> {
     let latest = 0;
-    for (const file of selfPluginRuntimePaths()) {
+    for (const file of selfPluginRuntimePaths(this.configDir)) {
       const localPath = resolveVaultPath(this.vaultPath, file);
       if (await exists(localPath)) {
         latest = Math.max(latest, (await fs.stat(localPath)).mtimeMs);
@@ -845,7 +849,7 @@ export class GitService {
 
   private async latestRemotePluginRuntimeTime(repoPath: string, pluginDir: string): Promise<number> {
     try {
-      const output = await this.gitTextAt(repoPath, ["log", "-1", "--format=%ct", "FETCH_HEAD", "--", ...pluginRuntimePathspecs(pluginDir)]);
+      const output = await this.gitTextAt(repoPath, ["log", "-1", "--format=%ct", "FETCH_HEAD", "--", ...pluginRuntimePathspecs(this.configDir, pluginDir)]);
       const seconds = Number.parseInt(output.trim(), 10);
       return Number.isFinite(seconds) ? seconds * 1000 : 0;
     } catch {
@@ -855,7 +859,7 @@ export class GitService {
 
   private async latestLocalPluginRuntimeTime(pluginDir: string): Promise<number> {
     let latest = 0;
-    const files = (await collectSyncablePluginFiles(this.vaultPath)).filter((file) => pluginDirFromPath(file) === pluginDir);
+    const files = (await collectSyncablePluginFiles(this.vaultPath, this.configDir)).filter((file) => pluginDirFromPath(file, this.configDir) === pluginDir);
     for (const file of files) {
       const localPath = resolveVaultPath(this.vaultPath, file);
       if (await exists(localPath)) {
@@ -892,7 +896,7 @@ export class GitService {
         await this.gitAt(tempRepo, ["read-tree", "--empty"]);
       }
 
-      const noteFiles = await collectNoteFiles(this.vaultPath);
+      const noteFiles = await collectNoteFiles(this.vaultPath, this.configDir);
       onProgress?.({ phase: "local", kind: "info", message: `${noteFiles.length} note files` });
       await timed("crypto", `encrypt ${noteFiles.length} note files`, async () => {
         for (const file of noteFiles) {
@@ -964,9 +968,9 @@ export class GitService {
         }
       }
 
-      const obsidianSnapshot = await timed("local", "hash .obsidian snapshot", () => this.localPlaintextObsidianSnapshot(includePlugins), onProgress);
+      const obsidianSnapshot = await timed("local", `hash ${this.configDir} snapshot`, () => this.localPlaintextObsidianSnapshot(includePlugins), onProgress);
       const remoteObsidianSnapshot = hasRemote
-        ? await timed("git", "read remote .obsidian snapshot", () => this.remotePlaintextObsidianSnapshot(tempRepo, includePlugins), onProgress)
+        ? await timed("git", `read remote ${this.configDir} snapshot`, () => this.remotePlaintextObsidianSnapshot(tempRepo, includePlugins), onProgress)
         : emptyPlaintextSnapshot();
       nextManifest.plaintext = {
         obsidianHash: obsidianSnapshot.obsidianHash,
@@ -980,7 +984,7 @@ export class GitService {
         return { changed, reused, skipped: true };
       }
 
-      await timed("git", "stage changed .obsidian files", () => this.syncPlaintextObsidianFiles(tempRepo, obsidianSnapshot, remoteObsidianSnapshot), onProgress);
+      await timed("git", `stage changed ${this.configDir} files`, () => this.syncPlaintextObsidianFiles(tempRepo, obsidianSnapshot, remoteObsidianSnapshot), onProgress);
       if (settings.syncKeyringToRemote && credential && settings.password) {
         await timed("crypto", "write remote keyring", () => this.writeRemoteKeyring(tempRepo, settings.password!), onProgress);
       }
@@ -1028,7 +1032,7 @@ export class GitService {
       let plaintextChanged = false;
 
       if (resolution.notes !== "local") {
-        const localNoteHashes = await timed("local", "hash local notes", async () => localHashMap(this.vaultPath, await collectNoteFiles(this.vaultPath)), onProgress);
+        const localNoteHashes = await timed("local", "hash local notes", async () => localHashMap(this.vaultPath, await collectNoteFiles(this.vaultPath, this.configDir)), onProgress);
         const changedRemoteNotes = Object.entries(manifest.files).filter(([file, entry]) => localNoteHashes.get(normalizeVaultPath(file)) !== entry.hash);
         for (const [file, entry] of Object.entries(manifest.files)) {
           if (localNoteHashes.get(normalizeVaultPath(file)) === entry.hash) {
@@ -1052,11 +1056,11 @@ export class GitService {
         onProgress?.({ phase: "local", kind: "info", message: "kept local notes" });
       }
 
-      const restoredObsidianFiles = await timed("git", "restore .obsidian files", () => this.restorePlaintextObsidianFiles(tempRepo, resolution, manifest.plaintext, onProgress), onProgress);
+      const restoredObsidianFiles = await timed("git", `restore ${this.configDir} files`, () => this.restorePlaintextObsidianFiles(tempRepo, resolution, manifest.plaintext, onProgress), onProgress);
       plaintextChanged ||= restoredObsidianFiles > 0;
 
       if (settings.deleteMissingFilesOnPull && resolution.notes === "remote") {
-        const localFiles = await collectNoteFiles(this.vaultPath);
+        const localFiles = await collectNoteFiles(this.vaultPath, this.configDir);
         for (const file of localFiles) {
           if (!remoteNoteSet.has(file)) {
             await this.moveNoteToTrash(file);
@@ -1121,7 +1125,7 @@ export class GitService {
   }
 
   private async localPlaintextObsidianSnapshot(includePlugins: boolean): Promise<EncryptedPlaintextSnapshot> {
-    const files = await collectPlaintextObsidianFiles(this.vaultPath, includePlugins);
+    const files = await collectPlaintextObsidianFiles(this.vaultPath, this.configDir, includePlugins);
     const oidMap = await this.localBlobOidMap(files);
     const obsidianFiles: Record<string, PlaintextSnapshotFile> = {};
     for (const file of files.sort()) {
@@ -1139,10 +1143,10 @@ export class GitService {
   }
 
   private async remotePlaintextObsidianSnapshot(tempRepo: string, includePlugins: boolean): Promise<EncryptedPlaintextSnapshot> {
-    const entries = await this.gitTextAt(tempRepo, ["ls-tree", "-r", "-z", "--long", "FETCH_HEAD", "--", ".obsidian"]);
+    const entries = await this.gitTextAt(tempRepo, ["ls-tree", "-r", "-z", "--long", "FETCH_HEAD", "--", this.configDir]);
     const obsidianFiles: Record<string, PlaintextSnapshotFile> = {};
     for (const entry of parseLongTreeEntries(entries)) {
-      if (!isPlaintextObsidianSyncPath(entry.file) && !(includePlugins && isSyncablePluginPath(entry.file))) {
+      if (!isPlaintextConfigSyncPath(entry.file, this.configDir) && !(includePlugins && isSyncablePluginPath(entry.file, this.configDir))) {
         continue;
       }
       obsidianFiles[entry.file] = {
@@ -1306,15 +1310,15 @@ export class GitService {
     onProgress?: ProgressFn,
   ): Promise<number> {
     const remoteSnapshot = manifestSnapshot?.obsidianFiles
-      ? filterPlaintextSnapshot(manifestSnapshot, (file) => isPlaintextObsidianSyncPath(file) || (resolution.plugins !== "local" && isSyncablePluginPath(file)))
+      ? filterPlaintextSnapshot(manifestSnapshot, (file) => isPlaintextConfigSyncPath(file, this.configDir) || (resolution.plugins !== "local" && isSyncablePluginPath(file, this.configDir)))
       : await this.remotePlaintextObsidianSnapshot(tempRepo, resolution.plugins !== "local");
     const localSnapshot = await this.localPlaintextObsidianSnapshot(resolution.plugins !== "local");
     const remoteSnapshotFiles = remoteSnapshot.obsidianFiles ?? {};
     const localSnapshotFiles = localSnapshot.obsidianFiles ?? {};
     const files = Object.keys(remoteSnapshotFiles)
-      .filter((file) => ((resolution.obsidian === "remote" || resolution.obsidian === "merge") && isPlaintextObsidianSyncPath(file))
-        || ((resolution.plugins === "remote" || resolution.plugins === "merge") && isSyncablePluginPath(file)));
-    const remotePluginFiles = files.filter(isSyncablePluginPath);
+      .filter((file) => ((resolution.obsidian === "remote" || resolution.obsidian === "merge") && isPlaintextConfigSyncPath(file, this.configDir))
+        || ((resolution.plugins === "remote" || resolution.plugins === "merge") && isSyncablePluginPath(file, this.configDir)));
+    const remotePluginFiles = files.filter((file) => isSyncablePluginPath(file, this.configDir));
     const remotePluginChoices = resolution.plugins === "merge"
       ? await this.pluginSyncChoices(tempRepo, remotePluginFiles)
       : new Map<string, PluginSyncChoice>();
@@ -1325,9 +1329,9 @@ export class GitService {
       changed += await this.removeLocalPluginFilesMissingFromRemote(remotePluginFiles, remotePluginDirsToApply);
     }
     for (const file of files) {
-      const choice = isSyncablePluginPath(file) ? resolution.plugins : resolution.obsidian;
-      if (isSyncablePluginPath(file)) {
-        const pluginDir = pluginDirFromPath(file);
+      const choice = isSyncablePluginPath(file, this.configDir) ? resolution.plugins : resolution.obsidian;
+      if (isSyncablePluginPath(file, this.configDir)) {
+        const pluginDir = pluginDirFromPath(file, this.configDir);
         if (choice === "merge" && (!pluginDir || !remotePluginChoices.get(pluginDir)?.useRemote)) {
           continue;
         }
@@ -1338,7 +1342,7 @@ export class GitService {
         continue;
       }
       const contents = (await this.gitAt(tempRepo, ["show", `FETCH_HEAD:${file}`])).stdout;
-      if (isSyncablePluginPath(file)) {
+      if (isSyncablePluginPath(file, this.configDir)) {
         await this.applyRemoteFile(file, contents, choice === "merge" ? "remote" : choice, "plugins", tempRepo, undefined, undefined, undefined, { saveConflictCopy: false });
         changed += 1;
         continue;
@@ -1351,7 +1355,7 @@ export class GitService {
   }
 
   private async pluginSyncChoices(tempRepo: string, remotePluginFiles: string[]): Promise<Map<string, PluginSyncChoice>> {
-    const remotePluginDirs = Array.from(new Set(remotePluginFiles.map(pluginDirFromPath).filter(Boolean) as string[]));
+    const remotePluginDirs = Array.from(new Set(remotePluginFiles.map((file) => pluginDirFromPath(file, this.configDir)).filter((value): value is string => Boolean(value))));
     const choices = new Map<string, PluginSyncChoice>();
     for (const pluginDir of remotePluginDirs) {
       choices.set(pluginDir, await this.pluginSyncChoice(tempRepo, pluginDir));
@@ -1402,10 +1406,10 @@ export class GitService {
 
   private async removeLocalPluginFilesMissingFromRemote(remotePluginFiles: string[], remotePluginChoices: Set<string>): Promise<number> {
     const remoteSet = new Set(remotePluginFiles.map((file) => normalizeVaultPath(file)));
-    const localPluginFiles = await collectSyncablePluginFiles(this.vaultPath);
+    const localPluginFiles = await collectSyncablePluginFiles(this.vaultPath, this.configDir);
     let removed = 0;
     for (const file of localPluginFiles) {
-      const pluginDir = pluginDirFromPath(file);
+      const pluginDir = pluginDirFromPath(file, this.configDir);
       if (pluginDir && remotePluginChoices.has(pluginDir) && !remoteSet.has(file)) {
         await fs.rm(resolveVaultPath(this.vaultPath, file), { force: true });
         removed += 1;
@@ -1717,7 +1721,7 @@ export class GitService {
 
   private async readPluginManifestFromRemote(tempRepo: string, pluginDir: string): Promise<PluginVersionInfo | null> {
     try {
-      const contents = (await this.gitAt(tempRepo, ["show", `FETCH_HEAD:.obsidian/plugins/${pluginDir}/manifest.json`])).stdout;
+      const contents = (await this.gitAt(tempRepo, ["show", `FETCH_HEAD:${configPath(this.configDir, "plugins", pluginDir, "manifest.json")}`])).stdout;
       return parsePluginVersionInfo(contents);
     } catch {
       return null;
@@ -1725,7 +1729,7 @@ export class GitService {
   }
 
   private async readPluginManifestFromLocal(pluginDir: string): Promise<PluginVersionInfo | null> {
-    const filePath = resolveVaultPath(this.vaultPath, normalizeVaultPath(path.join(".obsidian", "plugins", pluginDir, "manifest.json")));
+    const filePath = resolveVaultPath(this.vaultPath, configPath(this.configDir, "plugins", pluginDir, "manifest.json"));
     if (await exists(filePath)) {
       return parsePluginVersionInfo(await fs.readFile(filePath));
     }
@@ -1758,46 +1762,53 @@ export class GitService {
   }
 }
 
-export async function collectNoteFiles(vaultPath: string): Promise<string[]> {
+export async function collectNoteFiles(vaultPath: string, configDir: string): Promise<string[]> {
   const results: string[] = [];
-  await walk(vaultPath, "", results, isNotePath);
+  await walk(vaultPath, "", results, (file) => isNotePath(file, configDir));
   return results;
 }
 
-export async function collectPlaintextObsidianFiles(vaultPath: string, includePlugins = false): Promise<string[]> {
-  const obsidianPath = resolveVaultPath(vaultPath, ".obsidian");
-  if (!(await exists(obsidianPath))) {
+export async function collectPlaintextObsidianFiles(vaultPath: string, configDir: string, includePlugins = false): Promise<string[]> {
+  const configRoot = resolveVaultPath(vaultPath, configDir);
+  if (!(await exists(configRoot))) {
     return [];
   }
 
   const results: string[] = [];
   await walk(
     vaultPath,
-    ".obsidian",
+    configDir,
     results,
-    (file) => isPlaintextObsidianSyncPath(file) || (includePlugins && isSyncablePluginPath(file)),
+    (file) => isPlaintextConfigSyncPath(file, configDir) || (includePlugins && isSyncablePluginPath(file, configDir)),
     (file) => {
       const normalized = normalizeVaultPath(file);
-      if (normalized === ".obsidian/plugins") {
+      if (normalized === configPath(configDir, "plugins")) {
         return includePlugins;
       }
-      if (normalized.startsWith(".obsidian/plugins/")) {
-        return includePlugins && isSyncablePluginDirectory(normalized);
+      if (isUnderConfigPath(normalized, configDir, "plugins")) {
+        return includePlugins && isSyncablePluginDirectory(normalized, configDir);
       }
-      return normalized.startsWith(".obsidian/");
+      return isUnderConfigPath(normalized, configDir);
     },
   );
   return results;
 }
 
-export async function collectSyncablePluginFiles(vaultPath: string): Promise<string[]> {
-  const pluginsPath = resolveVaultPath(vaultPath, ".obsidian/plugins");
+export async function collectSyncablePluginFiles(vaultPath: string, configDir: string): Promise<string[]> {
+  const pluginsRoot = configPath(configDir, "plugins");
+  const pluginsPath = resolveVaultPath(vaultPath, pluginsRoot);
   if (!(await exists(pluginsPath))) {
     return [];
   }
 
   const results: string[] = [];
-  await walk(vaultPath, ".obsidian/plugins", results, isSyncablePluginPath, isSyncablePluginDirectory);
+  await walk(
+    vaultPath,
+    pluginsRoot,
+    results,
+    (file) => isSyncablePluginPath(file, configDir),
+    (file) => isSyncablePluginDirectory(file, configDir),
+  );
   return results;
 }
 
@@ -1894,10 +1905,10 @@ function filterPlaintextSnapshot(snapshot: EncryptedPlaintextSnapshot, predicate
   };
 }
 
-function pluginDirsFromSnapshot(snapshot: EncryptedPlaintextSnapshot): Set<string> {
+function pluginDirsFromSnapshot(snapshot: EncryptedPlaintextSnapshot, configDir: string): Set<string> {
   const dirs = new Set<string>();
   for (const file of Object.keys(snapshot.obsidianFiles ?? {})) {
-    const pluginDir = pluginDirFromPath(file);
+    const pluginDir = pluginDirFromPath(file, configDir);
     if (pluginDir) {
       dirs.add(pluginDir);
     }
@@ -2041,7 +2052,7 @@ async function removeTempPathWithRetries(target: string): Promise<void> {
 }
 
 function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function isTextMergeCandidate(file: string, ...contents: Buffer[]): boolean {
@@ -2573,53 +2584,54 @@ function encryptedObjectPath(file: string, hash: string): string {
   return `${SECURE_DIR}/objects/${objectId.slice(0, 2)}/${objectId}.enc`;
 }
 
-function isNotePath(vaultRelativePath: string): boolean {
+function isNotePath(vaultRelativePath: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(vaultRelativePath);
   const firstSegment = normalized.split("/")[0];
   return Boolean(normalized)
     && !isConflictCopyPath(normalized)
     && !EXCLUDED_TOP_LEVEL.has(firstSegment)
+    && firstSegment !== normalizeVaultPath(configDir)
     && firstSegment !== SECURE_DIR
     && firstSegment !== CONFLICTS_DIR
     && firstSegment !== NOTE_TRASH_DIR;
 }
 
-function isPlaintextObsidianSyncPath(vaultRelativePath: string): boolean {
+function isPlaintextConfigSyncPath(vaultRelativePath: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(vaultRelativePath);
-  return normalized.startsWith(".obsidian/")
+  return isUnderConfigPath(normalized, configDir)
     && !isConflictCopyPath(normalized)
-    && normalized !== ".obsidian/plugins"
-    && !normalized.startsWith(".obsidian/plugins/");
+    && normalized !== configPath(configDir, "plugins")
+    && !isUnderConfigPath(normalized, configDir, "plugins");
 }
 
-function isSyncablePluginPath(vaultRelativePath: string): boolean {
+function isSyncablePluginPath(vaultRelativePath: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(vaultRelativePath);
   if (isConflictCopyPath(normalized)) {
     return false;
   }
-  if (!normalized.startsWith(".obsidian/plugins/")) {
+  if (!isUnderConfigPath(normalized, configDir, "plugins")) {
     return false;
   }
-  const pluginDir = normalized.split("/")[2];
+  const pluginDir = pluginDirFromPath(normalized, configDir);
   if (!pluginDir) {
     return false;
   }
   if (SELF_PLUGIN_DIR_NAMES.has(pluginDir)) {
-    return isSelfPluginRuntimePath(normalized);
+    return isSelfPluginRuntimePath(normalized, configDir);
   }
   return true;
 }
 
-function isSyncablePluginDirectory(vaultRelativePath: string): boolean {
+function isSyncablePluginDirectory(vaultRelativePath: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(vaultRelativePath);
   if (isConflictCopyPath(normalized)) {
     return false;
   }
-  if (!normalized.startsWith(".obsidian/plugins/")) {
+  if (!isUnderConfigPath(normalized, configDir, "plugins")) {
     return false;
   }
   const parts = normalized.split("/");
-  const pluginDir = parts[2];
+  const pluginDir = pluginDirFromPath(normalized, configDir);
   if (!pluginDir) {
     return false;
   }
@@ -2633,26 +2645,34 @@ function isSyncablePluginDirectory(vaultRelativePath: string): boolean {
   return true;
 }
 
-function pluginDirFromPath(vaultRelativePath: string): string | null {
+function pluginDirFromPath(vaultRelativePath: string, configDir: string): string | null {
   const parts = normalizeVaultPath(vaultRelativePath).split("/");
-  return parts[0] === ".obsidian" && parts[1] === "plugins" && parts[2] ? parts[2] : null;
+  const configParts = normalizeVaultPath(configDir).split("/");
+  return configParts.every((part, index) => parts[index] === part)
+    && parts[configParts.length] === "plugins"
+    && parts[configParts.length + 1]
+    ? parts[configParts.length + 1]
+    : null;
 }
 
-function isSelfPluginRuntimePath(vaultRelativePath: string): boolean {
+function isSelfPluginRuntimePath(vaultRelativePath: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(vaultRelativePath);
   const parts = normalized.split("/");
-  return parts.length === 4
-    && parts[0] === ".obsidian"
-    && parts[1] === "plugins"
-    && SELF_PLUGIN_DIR_NAMES.has(parts[2])
-    && SELF_PLUGIN_RUNTIME_FILES.has(parts[3]);
+  const configParts = normalizeVaultPath(configDir).split("/");
+  const pluginDirIndex = configParts.length + 1;
+  const fileIndex = configParts.length + 2;
+  return parts.length === configParts.length + 3
+    && configParts.every((part, index) => parts[index] === part)
+    && parts[configParts.length] === "plugins"
+    && SELF_PLUGIN_DIR_NAMES.has(parts[pluginDirIndex])
+    && SELF_PLUGIN_RUNTIME_FILES.has(parts[fileIndex]);
 }
 
-function conflictCategoryForPath(vaultRelativePath: string): keyof SyncConflictResolution {
-  if (isSyncablePluginPath(vaultRelativePath)) {
+function conflictCategoryForPath(vaultRelativePath: string, configDir: string): keyof SyncConflictResolution {
+  if (isSyncablePluginPath(vaultRelativePath, configDir)) {
     return "plugins";
   }
-  if (isPlaintextObsidianSyncPath(vaultRelativePath)) {
+  if (isPlaintextConfigSyncPath(vaultRelativePath, configDir)) {
     return "obsidian";
   }
   return "notes";
@@ -2674,39 +2694,40 @@ function commonSyncPathspecExclusions(): string[] {
   ];
 }
 
-function selfPluginPathspecExclusions(): string[] {
+function selfPluginPathspecExclusions(configDir: string): string[] {
   const exclusions: string[] = [];
   for (const pluginDir of SELF_PLUGIN_DIR_NAMES) {
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/data.json`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/node_modules/**`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/src/**`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/release/**`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/.github/**`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/package.json`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/package-lock.json`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/tsconfig.json`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/esbuild.config.mjs`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/versions.json`);
-    exclusions.push(`:(exclude).obsidian/plugins/${pluginDir}/README.md`);
+    const pluginRoot = configPath(configDir, "plugins", pluginDir);
+    exclusions.push(`:(exclude)${pluginRoot}/data.json`);
+    exclusions.push(`:(exclude)${pluginRoot}/node_modules/**`);
+    exclusions.push(`:(exclude)${pluginRoot}/src/**`);
+    exclusions.push(`:(exclude)${pluginRoot}/release/**`);
+    exclusions.push(`:(exclude)${pluginRoot}/.github/**`);
+    exclusions.push(`:(exclude)${pluginRoot}/package.json`);
+    exclusions.push(`:(exclude)${pluginRoot}/package-lock.json`);
+    exclusions.push(`:(exclude)${pluginRoot}/tsconfig.json`);
+    exclusions.push(`:(exclude)${pluginRoot}/esbuild.config.mjs`);
+    exclusions.push(`:(exclude)${pluginRoot}/versions.json`);
+    exclusions.push(`:(exclude)${pluginRoot}/README.md`);
   }
   return exclusions;
 }
 
-function selfPluginRuntimePaths(): string[] {
+function selfPluginRuntimePaths(configDir: string): string[] {
   const paths: string[] = [];
   for (const pluginDir of SELF_PLUGIN_DIR_NAMES) {
     for (const file of SELF_PLUGIN_RUNTIME_FILES) {
-      paths.push(`.obsidian/plugins/${pluginDir}/${file}`);
+      paths.push(configPath(configDir, "plugins", pluginDir, file));
     }
   }
   return paths;
 }
 
-function pluginRuntimePathspecs(pluginDir: string): string[] {
+function pluginRuntimePathspecs(configDir: string, pluginDir: string): string[] {
   if (SELF_PLUGIN_DIR_NAMES.has(pluginDir)) {
-    return Array.from(SELF_PLUGIN_RUNTIME_FILES).map((file) => `.obsidian/plugins/${pluginDir}/${file}`);
+    return Array.from(SELF_PLUGIN_RUNTIME_FILES).map((file) => configPath(configDir, "plugins", pluginDir, file));
   }
-  return [`.obsidian/plugins/${pluginDir}`];
+  return [configPath(configDir, "plugins", pluginDir)];
 }
 
 function pluginDirsUsingRemote(choices: Map<string, PluginSyncChoice>): Set<string> {
@@ -2721,7 +2742,10 @@ function pluginDirsUsingRemote(choices: Map<string, PluginSyncChoice>): Set<stri
 
 function parsePluginVersionInfo(contents: Buffer): PluginVersionInfo | null {
   try {
-    const value = JSON.parse(contents.toString("utf8")) as { version?: string; releaseDate?: string; buildTime?: string };
+    const value = parseJson(contents.toString("utf8"));
+    if (!isPluginVersionInfoValue(value)) {
+      return null;
+    }
     if (!value.version) {
       return null;
     }
@@ -2733,6 +2757,14 @@ function parsePluginVersionInfo(contents: Buffer): PluginVersionInfo | null {
   } catch {
     return null;
   }
+}
+
+function parseJson<T>(value: string): T {
+  return JSON.parse(value) as T;
+}
+
+function isPluginVersionInfoValue(value: unknown): value is { version?: string; releaseDate?: string; buildTime?: string } {
+  return typeof value === "object" && value !== null;
 }
 
 function comparePluginVersions(a: PluginVersionInfo, b: PluginVersionInfo): number {
@@ -2788,6 +2820,16 @@ function initialPlaintextPullSummary(remote: RemoteConfig, protectedLocalFiles: 
 
 function normalizeVaultPath(filePath: string): string {
   return normalizePath(filePath).replace(/^\/+/, "");
+}
+
+function configPath(configDir: string, ...parts: string[]): string {
+  return normalizeVaultPath(path.join(configDir, ...parts));
+}
+
+function isUnderConfigPath(vaultRelativePath: string, configDir: string, ...parts: string[]): boolean {
+  const normalized = normalizeVaultPath(vaultRelativePath);
+  const root = configPath(configDir, ...parts);
+  return normalized.startsWith(`${root}/`);
 }
 
 function resolveVaultPath(root: string, vaultRelativePath: string, allowRoot = false): string {

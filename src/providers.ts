@@ -1,3 +1,4 @@
+import { requestUrl } from "obsidian";
 import { GitProviderId, ProviderAccount } from "./types";
 
 export interface ProviderRepo {
@@ -170,15 +171,21 @@ export class GitProviderClient {
       headers.set("Content-Type", "application/json");
     }
 
-    const response = await fetch(`${trimTrailingSlash(this.account.apiBaseUrl)}${path}`, {
-      ...init,
-      headers,
+    const headerRecord: Record<string, string> = {};
+    headers.forEach((value, key) => {
+      headerRecord[key] = value;
     });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Provider API request failed (${response.status}): ${text.slice(0, 300)}`);
+
+    const response = await requestUrl({
+      url: `${trimTrailingSlash(this.account.apiBaseUrl)}${path}`,
+      method: init.method,
+      headers: headerRecord,
+      body: typeof init.body === "string" ? init.body : undefined,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Provider API request failed (${response.status}): ${response.text.slice(0, 300)}`);
     }
-    return response.json() as Promise<T>;
+    return response.json as T;
   }
 }
 

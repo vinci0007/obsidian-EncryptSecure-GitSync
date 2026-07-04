@@ -451,7 +451,7 @@ function t(language: UiLanguage, key: TextKey): string {
 function addAutoSyncDurationOptions(dropdown: DropdownComponent, language: UiLanguage): void {
   dropdown.addOption("same-as-panel", t(language, "sameAsPanelDuration"));
   for (const item of UNLOCK_DURATIONS) {
-    dropdown.addOption(item.value, t(language, item.key as TextKey));
+    dropdown.addOption(item.value, t(language, item.key));
   }
 }
 
@@ -503,29 +503,29 @@ export default class SecureGitSyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.git = new GitService(this.getVaultPath());
+    this.git = new GitService(this.getVaultPath(), this.app.vault.configDir);
     await applyElectronProxy(this.settings);
 
     this.addCommand({
-      id: "secure-git-sync-push",
+      id: "push",
       name: this.text("cmdPush"),
       callback: () => this.runPasswordProtected("push"),
     });
 
     this.addCommand({
-      id: "secure-git-sync-pull",
+      id: "pull",
       name: this.text("cmdPull"),
       callback: () => this.runPasswordProtected("pull"),
     });
 
     this.addCommand({
-      id: "secure-git-sync-sync",
+      id: "sync",
       name: this.text("cmdSync"),
       callback: () => this.runPasswordProtected("sync"),
     });
 
     this.addCommand({
-      id: "secure-git-sync-status",
+      id: "status",
       name: this.text("cmdStatus"),
       callback: async () => {
         try {
@@ -537,13 +537,13 @@ export default class SecureGitSyncPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "secure-git-sync-open-actions",
+      id: "open-actions",
       name: this.text("operationPanel"),
       callback: () => this.openOperationPanel(),
     });
 
     this.addCommand({
-      id: "secure-git-sync-change-password",
+      id: "change-password",
       name: this.text("cmdChangePassword"),
       callback: () => this.changePassword(),
     });
@@ -816,7 +816,7 @@ export default class SecureGitSyncPlugin extends Plugin {
   }
 
   private defaultLocalKeyringPath(): string {
-    return path.join(this.getVaultPath(), ".obsidian", "plugins", "secure-git-sync", "keyring.json");
+    return path.join(this.getVaultPath(), this.app.vault.configDir, "plugins", "secure-git-sync", "keyring.json");
   }
 
   localKeyringDisplayPath(): string {
@@ -1129,7 +1129,7 @@ export default class SecureGitSyncPlugin extends Plugin {
       new Notice(message);
     } finally {
       this.operationRunning = false;
-      if (this.unlockSession?.oneTime && !document.querySelector(".secure-git-sync-panel")) {
+      if (this.unlockSession?.oneTime && !activeDocument.querySelector<HTMLElement>(".secure-git-sync-panel")) {
         this.unlockSession = null;
       }
     }
@@ -1557,7 +1557,7 @@ class OperationPanelModal extends Modal {
   private lastSyncEl!: HTMLElement;
   private conflictEl!: HTMLElement;
   private unlockEl!: HTMLElement;
-  private durationDropdown!: DropdownComponent;
+  private durationDropdown: DropdownComponent | null = null;
   private unsubscribe = (): void => {};
   private actionButtons: ButtonComponent[] = [];
 
@@ -1650,7 +1650,7 @@ class OperationPanelModal extends Modal {
       .setName(t(this.language, "sessionDuration"))
       .addDropdown((dropdown) => {
         for (const item of UNLOCK_DURATIONS) {
-          dropdown.addOption(item.value, t(this.language, item.key as TextKey));
+          dropdown.addOption(item.value, t(this.language, item.key));
         }
         dropdown.setValue(this.plugin.getCurrentUnlockDuration());
         dropdown.onChange((value) => {
@@ -1688,7 +1688,7 @@ class OperationPanelModal extends Modal {
     this.unlockEl.setText(`${t(this.language, "currentStatus")}: ${this.plugin.getUnlockLabel(this.language)}`);
     this.lastSyncEl.setText(`${t(this.language, "lastSync")}: ${this.plugin.settings.lastSyncAt ? `${new Date(this.plugin.settings.lastSyncAt).toLocaleString()} \u2014 ${this.plugin.settings.lastSyncSummary}` : t(this.language, "neverSynced")}`);
     this.renderConflicts(state);
-    if (this.durationDropdown) {
+    if (this.durationDropdown !== null) {
       this.durationDropdown.setValue(this.plugin.getCurrentUnlockDuration());
     }
 
@@ -1696,7 +1696,7 @@ class OperationPanelModal extends Modal {
     for (const button of this.actionButtons) {
       button.setDisabled(running);
     }
-    if (this.durationDropdown) {
+    if (this.durationDropdown !== null) {
       this.durationDropdown.setDisabled(running);
     }
   }
@@ -1822,7 +1822,7 @@ class ConflictResolverModal extends Modal {
     this.actionsEl = this.contentEl.createDiv({ cls: "secure-git-sync-resolver-actions" });
     this.editorsEl = this.contentEl.createDiv({ cls: "secure-git-sync-live-editors" });
     this.resultStatusEl = this.contentEl.createEl("div", { text: t(this.language, "saveResolved"), cls: "secure-git-sync-resolver-status" });
-    this.previewEl = document.createElement("textarea");
+    this.previewEl = activeDocument.createElement("textarea");
     this.previewEl.addClass("secure-git-sync-resolver-preview");
     this.previewEl.setAttr("aria-label", t(this.language, "preview"));
     this.previewEl.addEventListener("input", () => {
@@ -2307,7 +2307,7 @@ class UnlockSessionModal extends Modal {
         .setName(t(this.language, "sessionDuration"))
         .addDropdown((dropdown) => {
           for (const item of UNLOCK_DURATIONS) {
-            dropdown.addOption(item.value, t(this.language, item.key as TextKey));
+            dropdown.addOption(item.value, t(this.language, item.key));
           }
           dropdown.setValue(this.duration);
           dropdown.onChange((value) => {
@@ -2737,32 +2737,36 @@ function safeRemoteName(value: string): string {
 }
 
 function openExternalUrl(url: string): void {
-  try {
-    const electron = require("electron") as { shell?: { openExternal: (target: string) => Promise<void> } };
-    if (electron.shell) {
-      void electron.shell.openExternal(url);
-      return;
+  void (async () => {
+    try {
+      const electron = await getElectron();
+      if (electron.shell) {
+        await electron.shell.openExternal(url);
+        return;
+      }
+    } catch {
+      // Fall back to the browser API below.
     }
-  } catch {
-    // Fall back to the browser API below.
-  }
-  window.open(url, "_blank", "noopener,noreferrer");
+    window.open(url, "_blank", "noopener,noreferrer");
+  })();
 }
 
 function openLocalFolder(folderPath: string): void {
-  try {
-    const electron = require("electron") as { shell?: { openPath: (target: string) => Promise<string> } };
-    if (electron.shell) {
-      void electron.shell.openPath(folderPath);
+  void (async () => {
+    try {
+      const electron = await getElectron();
+      if (electron.shell) {
+        await electron.shell.openPath(folderPath);
+      }
+    } catch (error) {
+      new Notice(formatError(error));
     }
-  } catch (error) {
-    new Notice(formatError(error));
-  }
+  })();
 }
 
 async function pickLocalKeyringFile(defaultPath: string): Promise<string | null> {
   try {
-    const electron = require("electron") as { dialog?: ElectronDialog; remote?: { dialog?: ElectronDialog } };
+    const electron = await getElectron();
     const dialog = electron.dialog ?? electron.remote?.dialog;
     if (!dialog?.showOpenDialog) {
       return null;
@@ -2785,7 +2789,7 @@ async function pickLocalKeyringFile(defaultPath: string): Promise<string | null>
 
 async function applyElectronProxy(settings: SecureGitSettings): Promise<void> {
   try {
-    const electron = require("electron") as { remote?: { session?: { defaultSession?: ElectronSession } }; session?: { defaultSession?: ElectronSession } };
+    const electron = await getElectron();
     const session = electron.session?.defaultSession ?? electron.remote?.session?.defaultSession;
     if (!session?.setProxy) {
       return;
@@ -2807,8 +2811,29 @@ async function applyElectronProxy(settings: SecureGitSettings): Promise<void> {
   }
 }
 
+async function getElectron(): Promise<ElectronModule> {
+  try {
+    return await import("electron");
+  } catch {
+    return {};
+  }
+}
+
 interface ElectronSession {
   setProxy(config: { proxyRules?: string; proxyBypassRules?: string }): Promise<void>;
+}
+
+interface ElectronModule {
+  shell?: {
+    openExternal(target: string): Promise<void>;
+    openPath(target: string): Promise<string>;
+  };
+  dialog?: ElectronDialog;
+  remote?: {
+    dialog?: ElectronDialog;
+    session?: { defaultSession?: ElectronSession };
+  };
+  session?: { defaultSession?: ElectronSession };
 }
 
 interface ElectronDialog {
