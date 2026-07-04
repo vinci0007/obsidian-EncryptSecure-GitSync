@@ -7,5 +7,6 @@
   "description": "Password-confirmed Git sync with optional encrypted remote note snapshots.",
   "author": "vinci0007",
   "authorUrl": "",
-  "isDesktopOnly": true
+  "isDesktopOnly": true,
+  "buildTime": "2026-07-04T12:49:01.064Z"
 }

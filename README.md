@@ -80,7 +80,7 @@ release/secure-git-sync-<version>.zip
 release/secure-git-sync-<version>.sha256
 ```
 
-GitHub Actions release automation lives at `.github/workflows/release.yml`. It can be run manually, by pushing an `x.x.x` version tag such as `0.1.3`, or by changing the plugin version on `main`. The action builds the release package and publishes a GitHub Release for `<manifest.version>` when that release does not already exist.
+GitHub Actions release automation lives at `.github/workflows/release.yml`. It can be run manually, by pushing an `x.x.x` version tag such as `0.1.4`, or by changing the plugin version on `main`. The action builds the release package and publishes a GitHub Release for `<manifest.version>` when that release does not already exist.
 
 ## Installation
 
