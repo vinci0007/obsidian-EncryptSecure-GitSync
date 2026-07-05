@@ -2221,16 +2221,17 @@ async function createTempGitRepo(vaultPath?: string): Promise<string> {
   const tempRepo = vaultPath
     ? resolveVaultPath(vaultPath, `${SECURE_DIR}/git-cache`)
     : await fs.mkdtemp(path.join(os.tmpdir(), "secure-git-sync-"));
+  const allowedRoots = vaultPath ? [vaultPath, os.tmpdir()] : [os.tmpdir()];
   await fs.mkdir(tempRepo, { recursive: true });
   if (!(await exists(path.join(tempRepo, ".git")))) {
-    await runGitAt(tempRepo, ["init"]);
+    await runGitAt(tempRepo, ["init"], null, undefined, allowedRoots);
   }
-  await runGitAt(tempRepo, ["config", "user.name", "Secure Git Sync"]);
-  await runGitAt(tempRepo, ["config", "user.email", "secure-git-sync@local"]);
-  await runGitAt(tempRepo, ["read-tree", "--empty"]);
-  const remotes = (await runGitAt(tempRepo, ["remote"])).stdout.toString("utf8").split(/\r?\n/).filter(Boolean);
+  await runGitAt(tempRepo, ["config", "user.name", "Secure Git Sync"], null, undefined, allowedRoots);
+  await runGitAt(tempRepo, ["config", "user.email", "secure-git-sync@local"], null, undefined, allowedRoots);
+  await runGitAt(tempRepo, ["read-tree", "--empty"], null, undefined, allowedRoots);
+  const remotes = (await runGitAt(tempRepo, ["remote"], null, undefined, allowedRoots)).stdout.toString("utf8").split(/\r?\n/).filter(Boolean);
   for (const remote of remotes) {
-    await runGitAt(tempRepo, ["remote", "remove", remote]);
+    await runGitAt(tempRepo, ["remote", "remove", remote], null, undefined, allowedRoots);
   }
   return tempRepo;
 }
