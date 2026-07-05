@@ -16,7 +16,7 @@ const MANIFEST_INDEX_AAD = `${SECURE_DIR}/manifest-index`;
 const MANIFEST_SHARD_DIR = `${SECURE_DIR}/manifest-shards`;
 const MANIFEST_SHARD_AAD = `${SECURE_DIR}/manifest-shard`;
 const KEYRING_PATH = `${SECURE_DIR}/keyring.json`;
-const NOTE_PROCESS_CONCURRENCY = 8;
+const NOTE_PROCESS_CONCURRENCY = 6;
 const MANIFEST_SHARD_COUNT = 16;
 const DEFAULT_SYNC_RESOLUTION: SyncConflictResolution = {
   notes: "merge",
@@ -95,6 +95,16 @@ interface EncryptedManifestShard {
   files: Record<string, EncryptedManifestFile>;
 }
 
+interface ExistingIndexBlob {
+  file: string;
+  oid: string;
+}
+
+interface NewIndexBlob {
+  file: string;
+  contents: Buffer;
+}
+
 interface EncryptedPlaintextSnapshot {
   obsidianHash?: string;
   obsidianFiles?: Record<string, PlaintextSnapshotFile>;
@@ -145,6 +155,17 @@ interface InitialPullMergeResult {
 interface PullEncryptedResult {
   restored: number;
   plaintextChanged: boolean;
+  key: CryptoKey;
+  importedRemoteKey: boolean;
+  importedLocalKeyring: boolean;
+  remoteKeyring?: PasswordConfig;
+}
+
+interface EncryptedRemoteState {
+  tempRepo: string;
+  hasRemote: boolean;
+  manifest: EncryptedManifest;
+  objects: Map<string, string>;
   key: CryptoKey;
   importedRemoteKey: boolean;
   importedLocalKeyring: boolean;
@@ -277,7 +298,7 @@ export class GitService {
     settings: SecureGitSettings,
     key: CryptoKey | null,
     onProgress?: ProgressFn,
-    options: { includePlugins?: boolean; credential?: SyncCredential } = {},
+    options: { includePlugins?: boolean; credential?: SyncCredential; queuedChangedFiles?: string[] } = {},
   ): Promise<string> {
     await this.ensureRemote(remote);
     const auth = await createGitAuthContext(remote, settings);
@@ -297,8 +318,8 @@ export class GitService {
         throw new Error("Encryption key is required.");
       }
 
-      await timed("local", "commit plaintext", () => this.commitLocalPlaintext(settings.commitMessageTemplate, true, Boolean(options.includePlugins)), onProgress);
-      const result = await this.pushEncryptedObjects(remote, settings, key, auth.env, onProgress, Boolean(options.includePlugins), options.credential);
+      const localChangedFiles = await timed("local", "commit plaintext", () => this.commitLocalPlaintext(settings.commitMessageTemplate, true, Boolean(options.includePlugins)), onProgress);
+      const result = await this.pushEncryptedObjects(remote, settings, key, auth.env, onProgress, Boolean(options.includePlugins), options.credential, uniquePaths([...(options.queuedChangedFiles ?? []), ...localChangedFiles]));
       if (result.skipped) {
         return `No encrypted changes to push to ${remote.name}/${remote.branch}.`;
       }
@@ -355,6 +376,78 @@ export class GitService {
         remoteEncrypted: true,
         key,
       };
+    } finally {
+      await auth.cleanup();
+    }
+  }
+
+  async sync(
+    remote: RemoteConfig,
+    settings: SecureGitSettings,
+    key: CryptoKey | null,
+    onProgress?: ProgressFn,
+    resolution: SyncConflictResolution = DEFAULT_SYNC_RESOLUTION,
+    includePlugins = true,
+    credential?: SyncCredential,
+    queuedChangedFiles?: string[],
+  ): Promise<PullResult & { pushSummary: string }> {
+    await this.ensureRemote(remote);
+    const auth = await createGitAuthContext(remote, settings);
+    try {
+      const remoteEncrypted = !settings.encryptionEnabled
+        ? await timed("network", `detect encrypted remote ${remote.name}/${remote.branch}`, () => this.remoteHasEncryptedManifest(remote, auth.env), onProgress)
+        : false;
+      const useEncryptedRemote = settings.encryptionEnabled || remoteEncrypted;
+      if (!useEncryptedRemote) {
+        const pullResult = await this.pullPlaintext(remote, settings, auth.env, onProgress, resolution);
+        await timed("local", "commit plaintext", () => this.commitLocalPlaintext(settings.commitMessageTemplate), onProgress);
+        await timed("network", `push HEAD to ${remote.name}/${remote.branch}`, () => this.git(["push", remote.name, `HEAD:${remote.branch}`], auth.env), onProgress);
+        return { ...pullResult, pushSummary: `Pushed to ${remote.name}/${remote.branch}.` };
+      }
+
+      if (!key) {
+        throw new Error("Encryption key is required.");
+      }
+
+      const tempRepo = await createTempGitRepo(this.vaultPath);
+      try {
+        await this.gitAt(tempRepo, ["remote", "add", remote.name, remote.url], null, auth.env);
+        const remoteState = await this.fetchEncryptedRemoteState(tempRepo, remote, settings, key, auth.env, onProgress, credential);
+        key = remoteState.key;
+        if (remoteState.remoteKeyring) {
+          settings.password = remoteState.remoteKeyring;
+        }
+
+        const pullState = await this.pullEncryptedObjects(remote, settings, key, auth.env, onProgress, resolution, credential, remoteState);
+        await this.pruneConflictCopies(settings.conflictRetentionDays);
+        const conflictDirs = await this.listConflictDirs();
+        const conflictCopies = await countConflictFiles(this.vaultPath);
+        const pullResult: PullResult = {
+          summary: `${remoteEncrypted ? "Auto-detected encrypted remote. " : ""}${pullState.importedRemoteKey ? "Imported remote encryption key. " : ""}${pullState.importedLocalKeyring ? "Imported local keyring. " : ""}Pulled and decrypted ${pullState.restored} encrypted notes from ${remote.name}/${remote.branch}.`,
+          restored: pullState.restored,
+          plaintextChanged: pullState.plaintextChanged,
+          conflictCopies,
+          conflictDirs,
+          remoteEncrypted: true,
+          key,
+        };
+        if (conflictCopies > 0 || conflictDirs.length > 0) {
+          return { ...pullResult, pushSummary: "Resolve conflicts before pushing." };
+        }
+
+        const localChangedFiles = await timed("local", "commit plaintext", () => this.commitLocalPlaintext(settings.commitMessageTemplate, true, includePlugins || remoteEncrypted), onProgress);
+        const changedFiles = uniquePaths([...(queuedChangedFiles ?? []), ...localChangedFiles]);
+        if (localChangedFiles.length === 0 && !pullState.plaintextChanged && !(await this.hasLocalPlaintextChanges(includePlugins))) {
+          return { ...pullResult, pushSummary: "No local changes to push." };
+        }
+        const pushState = await this.pushEncryptedObjects(remote, settings, key, auth.env, onProgress, includePlugins || remoteEncrypted, credential, changedFiles, remoteState);
+        const pushSummary = pushState.skipped
+          ? `No encrypted changes to push to ${remote.name}/${remote.branch}.`
+          : `Pushed encrypted snapshot to ${remote.name}/${remote.branch}: ${pushState.changed} changed, ${pushState.reused} reused.`;
+        return { ...pullResult, pushSummary };
+      } finally {
+        await removeTempRepo(tempRepo);
+      }
     } finally {
       await auth.cleanup();
     }
@@ -606,7 +699,7 @@ export class GitService {
     };
   }
 
-  private async commitLocalPlaintext(template: string, encryptedMode = false, includePlugins = false): Promise<void> {
+  private async commitLocalPlaintext(template: string, encryptedMode = false, includePlugins = false): Promise<string[]> {
     const commonExclusions = commonSyncPathspecExclusions();
     if (encryptedMode) {
       const pluginsExclusion = `:(exclude)${configPath(this.configDir, "plugins")}/**`;
@@ -618,10 +711,12 @@ export class GitService {
       await this.git(["add", "--all", "--", ".", ...selfPluginPathspecExclusions(this.configDir), ...commonExclusions]);
     }
     const staged = await this.gitText(["diff", "--cached", "--name-only"]);
+    const changedFiles = staged.split(/\r?\n/).map(normalizeVaultPath).filter(Boolean);
     if (!staged.trim()) {
-      return;
+      return [];
     }
     await this.git(["commit", "-m", renderCommitMessage(template)]);
+    return changedFiles;
   }
 
   private async hasLocalHead(): Promise<boolean> {
@@ -945,13 +1040,18 @@ export class GitService {
     onProgress?: ProgressFn,
     includePlugins = false,
     credential?: SyncCredential,
+    localChangedFiles?: string[],
+    remoteState?: EncryptedRemoteState,
   ): Promise<{ changed: number; reused: number; skipped: boolean }> {
-    const tempRepo = await createTempGitRepo(this.vaultPath);
+    const ownsTempRepo = !remoteState;
+    const tempRepo = remoteState?.tempRepo ?? await createTempGitRepo(this.vaultPath);
     try {
-      await this.gitAt(tempRepo, ["remote", "add", remote.name, remote.url], null, authEnv);
-      const hasRemote = await timed("network", `fetch ${remote.name}/${remote.branch} (manifest)`, () => this.fetchRemoteBranch(tempRepo, remote, authEnv), onProgress);
-      const previousManifest = hasRemote ? await timed("crypto", "decrypt remote manifest", () => this.readRemoteManifest(tempRepo, key), onProgress) : emptyManifest();
-      const previousObjects = hasRemote ? await timed("git", "list existing encrypted objects", () => this.listTreeEntries(tempRepo, "FETCH_HEAD", `${SECURE_DIR}/objects`), onProgress) : new Map<string, string>();
+      if (!remoteState) {
+        await this.gitAt(tempRepo, ["remote", "add", remote.name, remote.url], null, authEnv);
+      }
+      const hasRemote = remoteState?.hasRemote ?? await timed("network", `fetch ${remote.name}/${remote.branch} (manifest)`, () => this.fetchRemoteBranch(tempRepo, remote, authEnv), onProgress);
+      const previousManifest = remoteState?.manifest ?? (hasRemote ? await timed("crypto", "decrypt remote manifest", () => this.readRemoteManifest(tempRepo, key), onProgress) : emptyManifest());
+      const previousObjects = remoteState?.objects ?? (hasRemote ? await timed("git", "list existing encrypted objects", () => this.listTreeEntries(tempRepo, "FETCH_HEAD", `${SECURE_DIR}/objects`), onProgress) : new Map<string, string>());
       const nextManifest: EncryptedManifest = emptyManifest(settings.password ?? undefined);
       const nextTombstones: Record<string, EncryptedManifestTombstone> = { ...(previousManifest.tombstones ?? {}) };
       nextManifest.tombstones = nextTombstones;
@@ -964,10 +1064,12 @@ export class GitService {
         await this.gitAt(tempRepo, ["read-tree", "--empty"]);
       }
 
-      const noteFiles = await collectNoteFiles(this.vaultPath, this.configDir);
+      const noteFiles = await timed("local", "list current notes", () => this.currentNoteFiles(previousManifest, settings, localChangedFiles), onProgress);
       onProgress?.({ phase: "local", kind: "info", message: `${noteFiles.length} note files` });
       const nextNoteCache: Record<string, NoteFileCacheEntry> = {};
-      const noteResults = await timed("crypto", `encrypt changed notes from ${noteFiles.length} files`, () => mapLimit(noteFiles, NOTE_PROCESS_CONCURRENCY, async (file) => {
+      const existingIndexBlobs: ExistingIndexBlob[] = [];
+      const newIndexBlobs: NewIndexBlob[] = [];
+      const noteResults = await timed("crypto", `process ${noteFiles.length} note files (cache/hash/encrypt)`, () => mapLimit(noteFiles, NOTE_PROCESS_CONCURRENCY, async (file) => {
           const now = new Date().toISOString();
           const absolutePath = resolveVaultPath(this.vaultPath, file);
           const stat = await fs.stat(absolutePath);
@@ -1059,14 +1161,19 @@ export class GitService {
         };
 
         if (result.kind === "reuse") {
-          await this.addExistingBlobToIndex(tempRepo, result.objectPath, result.oid);
+          existingIndexBlobs.push({ file: result.objectPath, oid: result.oid });
           metadataChanged ||= result.metadataChanged;
           reused += 1;
         } else {
-          await this.addNewBlobToIndex(tempRepo, result.objectPath, result.encrypted);
+          newIndexBlobs.push({ file: result.objectPath, contents: result.encrypted });
           changed += 1;
         }
       }
+
+      await timed("git", "stage encrypted note objects", async () => {
+        await this.addExistingBlobsToIndex(tempRepo, existingIndexBlobs);
+        await this.addNewBlobsToIndex(tempRepo, newIndexBlobs);
+      }, onProgress);
 
       for (const [file, entry] of Object.entries(previousManifest.files)) {
         if (!nextManifest.files[file] && entry.id) {
@@ -1080,6 +1187,7 @@ export class GitService {
         }
       }
       settings.noteFileCache = nextNoteCache;
+      settings.noteFileList = noteFiles;
 
       const obsidianSnapshot = await timed("local", `hash ${this.configDir} snapshot`, () => this.localPlaintextObsidianSnapshot(includePlugins), onProgress);
       const remoteObsidianSnapshot = hasRemote
@@ -1117,7 +1225,9 @@ export class GitService {
 
       return { changed, reused, skipped: false };
     } finally {
-      await removeTempRepo(tempRepo);
+      if (ownsTempRepo) {
+        await removeTempRepo(tempRepo);
+      }
     }
   }
 
@@ -1129,15 +1239,27 @@ export class GitService {
     onProgress?: ProgressFn,
     resolution: SyncConflictResolution = DEFAULT_SYNC_RESOLUTION,
     credential?: SyncCredential,
+    remoteState?: EncryptedRemoteState,
   ): Promise<PullEncryptedResult> {
-    const tempRepo = await createTempGitRepo(this.vaultPath);
+    const ownsTempRepo = !remoteState;
+    const tempRepo = remoteState?.tempRepo ?? await createTempGitRepo(this.vaultPath);
     try {
-      await this.gitAt(tempRepo, ["remote", "add", remote.name, remote.url], null, authEnv);
-      const hasRemote = await timed("network", `fetch ${remote.name}/${remote.branch} (manifest)`, () => this.fetchRemoteBranch(tempRepo, remote, authEnv), onProgress);
+      if (!remoteState) {
+        await this.gitAt(tempRepo, ["remote", "add", remote.name, remote.url], null, authEnv);
+      }
+      const hasRemote = remoteState?.hasRemote ?? await timed("network", `fetch ${remote.name}/${remote.branch} (manifest)`, () => this.fetchRemoteBranch(tempRepo, remote, authEnv), onProgress);
       if (!hasRemote) {
         return { restored: 0, plaintextChanged: false, key, importedRemoteKey: false, importedLocalKeyring: false };
       }
-      const resolved = await timed("crypto", "decrypt remote manifest", () => this.readRemoteManifestWithFallback(tempRepo, key, credential), onProgress);
+      const resolved = remoteState
+        ? {
+          manifest: remoteState.manifest,
+          key: remoteState.key,
+          importedRemoteKey: remoteState.importedRemoteKey,
+          importedLocalKeyring: remoteState.importedLocalKeyring,
+          remoteKeyring: remoteState.remoteKeyring,
+        }
+        : await timed("crypto", "decrypt remote manifest", () => this.readRemoteManifestWithFallback(tempRepo, key, credential), onProgress);
       const manifest = resolved.manifest;
       key = resolved.key;
       const remoteNoteSet = new Set(Object.keys(manifest.files));
@@ -1153,19 +1275,21 @@ export class GitService {
             syncNoteIndexFromManifest(file, entry, settings);
           }
         }
-        await timed("crypto", `decrypt ${changedRemoteNotes.length} changed notes`, async () => {
-          for (const [file, entry] of changedRemoteNotes) {
-            const encrypted = (await this.gitAt(tempRepo, ["show", `FETCH_HEAD:${entry.objectPath}`])).stdout;
+        const encryptedBlobs = await timed("git", `read ${changedRemoteNotes.length} remote encrypted objects`, () => this.readRemoteBlobs(tempRepo, changedRemoteNotes.map(([, entry]) => entry.objectPath)), onProgress);
+        restored = await timed("crypto", `decrypt and apply ${changedRemoteNotes.length} changed notes`, async () => {
+          const applied = await mapLimit(changedRemoteNotes, NOTE_PROCESS_CONCURRENCY, async ([file, entry], index) => {
+            const encrypted = encryptedBlobs[index];
             const plaintext = await decryptFileBytes(encrypted, key, file);
             const hash = sha256Hex(plaintext);
             if (hash !== entry.hash) {
               throw new Error(`Decrypted content hash mismatch for ${file}.`);
             }
             await this.applyRemoteFile(file, plaintext, resolution.notes, "notes", tempRepo, entry.contentUpdatedAt ?? entry.updatedAt, entry, settings);
-            restored += 1;
-            plaintextChanged = true;
-          }
+            return 1;
+          });
+          return applied.reduce((total, count) => total + count, 0);
         }, onProgress);
+        plaintextChanged ||= restored > 0;
       } else {
         onProgress?.({ phase: "local", kind: "info", message: "kept local notes" });
       }
@@ -1182,10 +1306,15 @@ export class GitService {
         }
         await this.pruneNoteTrash(settings.noteTrashRetentionDays);
       }
+      settings.noteFileList = settings.deleteMissingFilesOnPull && resolution.notes === "remote"
+        ? Array.from(remoteNoteSet).sort()
+        : Array.from(new Set([...(settings.noteFileList ?? []), ...remoteNoteSet])).sort();
 
       return { restored, plaintextChanged, key, importedRemoteKey: resolved.importedRemoteKey, importedLocalKeyring: resolved.importedLocalKeyring, remoteKeyring: resolved.remoteKeyring };
     } finally {
-      await removeTempRepo(tempRepo);
+      if (ownsTempRepo) {
+        await removeTempRepo(tempRepo);
+      }
     }
   }
 
@@ -1195,6 +1324,41 @@ export class GitService {
       return true;
     }
     return this.tryGitAt(tempRepo, ["fetch", remote.name, remote.branch], authEnv);
+  }
+
+  private async fetchEncryptedRemoteState(
+    tempRepo: string,
+    remote: RemoteConfig,
+    settings: SecureGitSettings,
+    key: CryptoKey,
+    authEnv?: NodeJS.ProcessEnv,
+    onProgress?: ProgressFn,
+    credential?: SyncCredential,
+  ): Promise<EncryptedRemoteState> {
+    const hasRemote = await timed("network", `fetch ${remote.name}/${remote.branch} once`, () => this.fetchRemoteBranch(tempRepo, remote, authEnv), onProgress);
+    if (!hasRemote) {
+      return {
+        tempRepo,
+        hasRemote: false,
+        manifest: emptyManifest(settings.password ?? undefined),
+        objects: new Map<string, string>(),
+        key,
+        importedRemoteKey: false,
+        importedLocalKeyring: false,
+      };
+    }
+    const resolved = await timed("crypto", "decrypt remote manifest once", () => this.readRemoteManifestWithFallback(tempRepo, key, credential), onProgress);
+    const objects = await timed("git", "list existing encrypted objects once", () => this.listTreeEntries(tempRepo, "FETCH_HEAD", `${SECURE_DIR}/objects`), onProgress);
+    return {
+      tempRepo,
+      hasRemote,
+      manifest: resolved.manifest,
+      objects,
+      key: resolved.key,
+      importedRemoteKey: resolved.importedRemoteKey,
+      importedLocalKeyring: resolved.importedLocalKeyring,
+      remoteKeyring: resolved.remoteKeyring,
+    };
   }
 
   private async remoteHasEncryptedManifest(remote: RemoteConfig, authEnv?: NodeJS.ProcessEnv): Promise<boolean> {
@@ -1221,6 +1385,58 @@ export class GitService {
       return parseTreeEntries(output).some((entry) => entry.file === normalizeVaultPath(file));
     } catch {
       return false;
+    }
+  }
+
+  private async currentNoteFiles(
+    previousManifest: EncryptedManifest,
+    settings: SecureGitSettings,
+    localChangedFiles?: string[],
+  ): Promise<string[]> {
+    const cachedList = (settings.noteFileList ?? []).map(normalizeVaultPath).filter((file) => isNotePath(file, this.configDir));
+    const previousFiles = Object.keys(previousManifest.files).map(normalizeVaultPath).filter((file) => isNotePath(file, this.configDir));
+    if (cachedList.length > 0 && localChangedFiles) {
+      const files = new Set(cachedList);
+      for (const changedFile of localChangedFiles.map(normalizeVaultPath)) {
+        if (!isNotePath(changedFile, this.configDir)) {
+          continue;
+        }
+        if (await exists(resolveVaultPath(this.vaultPath, changedFile))) {
+          files.add(changedFile);
+        } else {
+          files.delete(changedFile);
+        }
+      }
+      return Array.from(files).sort();
+    }
+    if (previousFiles.length > 0 && localChangedFiles) {
+      const files = new Set(previousFiles);
+      for (const changedFile of localChangedFiles.map(normalizeVaultPath)) {
+        if (!isNotePath(changedFile, this.configDir)) {
+          continue;
+        }
+        if (await exists(resolveVaultPath(this.vaultPath, changedFile))) {
+          files.add(changedFile);
+        } else {
+          files.delete(changedFile);
+        }
+      }
+      return Array.from(files).sort();
+    }
+
+    const tracked = await this.trackedNoteFiles();
+    if (tracked.length > 0) {
+      return tracked;
+    }
+    return collectNoteFiles(this.vaultPath, this.configDir);
+  }
+
+  private async trackedNoteFiles(): Promise<string[]> {
+    try {
+      const output = await this.gitText(["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", "."]);
+      return output.split("\0").map(normalizeVaultPath).filter((file) => isNotePath(file, this.configDir)).sort();
+    } catch {
+      return [];
     }
   }
 
@@ -1478,6 +1694,15 @@ export class GitService {
       map.set(entry.file, entry.oid);
     }
     return map;
+  }
+
+  private async readRemoteBlobs(tempRepo: string, objectPaths: string[]): Promise<Buffer[]> {
+    if (objectPaths.length === 0) {
+      return [];
+    }
+    const requests = objectPaths.map((objectPath) => `FETCH_HEAD:${normalizeVaultPath(objectPath)}`);
+    const output = (await this.gitAt(tempRepo, ["cat-file", "--batch"], Buffer.from(`${requests.join("\n")}\n`, "utf8"))).stdout;
+    return parseCatFileBatch(output, objectPaths.length);
   }
 
   private async restorePlaintextObsidianFiles(
@@ -1883,12 +2108,49 @@ export class GitService {
   }
 
   private async addExistingBlobToIndex(tempRepo: string, file: string, oid: string): Promise<void> {
-    await this.gitAt(tempRepo, ["update-index", "--add", "--cacheinfo", "100644", oid, file]);
+    await this.addExistingBlobsToIndex(tempRepo, [{ file, oid }]);
+  }
+
+  private async addExistingBlobsToIndex(tempRepo: string, entries: ExistingIndexBlob[]): Promise<void> {
+    if (entries.length === 0) {
+      return;
+    }
+    const input = Buffer.from(entries.map(({ file, oid }) => {
+      assertValidIndexInfo(file, oid);
+      return `100644 ${oid}\t${file}\n`;
+    }).join(""), "utf8");
+    await this.gitAt(tempRepo, ["update-index", "--index-info"], input);
   }
 
   private async addNewBlobToIndex(tempRepo: string, file: string, contents: Buffer): Promise<void> {
-    const hash = (await this.gitAt(tempRepo, ["hash-object", "-w", "--stdin"], contents)).stdout.toString("utf8").trim();
-    await this.addExistingBlobToIndex(tempRepo, file, hash);
+    await this.addNewBlobsToIndex(tempRepo, [{ file, contents }]);
+  }
+
+  private async addNewBlobsToIndex(tempRepo: string, entries: NewIndexBlob[]): Promise<void> {
+    if (entries.length === 0) {
+      return;
+    }
+    const stageDir = normalizeVaultPath(path.join(SECURE_DIR, "blob-stage", `${Date.now()}-${randomUUID()}`));
+    const stageRoot = resolveVaultPath(tempRepo, stageDir);
+    await fs.mkdir(stageRoot, { recursive: true });
+    try {
+      const stageFiles = await mapLimit(entries, NOTE_PROCESS_CONCURRENCY, async (entry, index) => {
+        const stageFile = normalizeVaultPath(path.join(stageDir, `${index}-${randomUUID()}.blob`));
+        await fs.writeFile(resolveVaultPath(tempRepo, stageFile), entry.contents);
+        return stageFile;
+      });
+      const input = Buffer.from(`${stageFiles.join("\n")}\n`, "utf8");
+      const hashes = (await this.gitAt(tempRepo, ["hash-object", "-w", "--stdin-paths"], input)).stdout.toString("utf8").split(/\r?\n/).filter(Boolean);
+      if (hashes.length !== entries.length) {
+        throw new Error("Git returned an unexpected number of blob hashes.");
+      }
+      await this.addExistingBlobsToIndex(tempRepo, entries.map((entry, index) => ({
+        file: entry.file,
+        oid: hashes[index],
+      })));
+    } finally {
+      await fs.rm(stageRoot, { recursive: true, force: true });
+    }
   }
 
   private async shouldUseRemoteSelfPlugin(tempRepo: string): Promise<boolean> {
@@ -2161,6 +2423,10 @@ function samePlaintextSnapshot(a: EncryptedPlaintextSnapshot, b: EncryptedPlaint
 
 function sortPlaintextSnapshotFiles(files: Record<string, PlaintextSnapshotFile>): Record<string, PlaintextSnapshotFile> {
   return Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function uniquePaths(files: string[]): string[] {
+  return Array.from(new Set(files.map(normalizeVaultPath).filter(Boolean))).sort();
 }
 
 function hasDifferences(counts: DifferenceCounts): boolean {
@@ -2534,6 +2800,7 @@ function validateGitInvocation(cwd: string, args: string[], allowedRoots: string
 const SAFE_GIT_COMMANDS = new Set([
   "add",
   "branch",
+  "cat-file",
   "checkout",
   "commit",
   "commit-tree",
@@ -2557,6 +2824,15 @@ const SAFE_GIT_COMMANDS = new Set([
   "write-tree",
 ]);
 
+function assertValidIndexInfo(file: string, oid: string): void {
+  if (!/^[0-9a-f]{40,64}$/i.test(oid)) {
+    throw new Error("Refusing to add an invalid Git object id to the index.");
+  }
+  if (!file || /[\0\r\n\t]/.test(file) || normalizeVaultPath(file) !== file) {
+    throw new Error("Refusing to add an invalid path to the Git index.");
+  }
+}
+
 function parseTreeEntries(output: string): TreeEntry[] {
   return output.split("\0").filter(Boolean).map((entry) => {
     const tabIndex = entry.indexOf("\t");
@@ -2566,6 +2842,36 @@ function parseTreeEntries(output: string): TreeEntry[] {
       file: normalizeVaultPath(entry.slice(tabIndex + 1)),
     };
   });
+}
+
+function parseCatFileBatch(output: Buffer, expected: number): Buffer[] {
+  const blobs: Buffer[] = [];
+  let offset = 0;
+  while (offset < output.length && blobs.length < expected) {
+    const headerEnd = output.indexOf(0x0a, offset);
+    if (headerEnd < 0) {
+      throw new Error("Git cat-file returned a truncated header.");
+    }
+    const header = output.subarray(offset, headerEnd).toString("utf8");
+    offset = headerEnd + 1;
+    const parts = header.split(" ");
+    if (parts.length >= 2 && parts[1] === "missing") {
+      throw new Error("Remote encrypted object is missing.");
+    }
+    const size = Number.parseInt(parts[2] ?? "", 10);
+    if (!Number.isFinite(size) || size < 0 || offset + size > output.length) {
+      throw new Error("Git cat-file returned an invalid blob size.");
+    }
+    blobs.push(output.subarray(offset, offset + size));
+    offset += size;
+    if (output[offset] === 0x0a) {
+      offset += 1;
+    }
+  }
+  if (blobs.length !== expected) {
+    throw new Error("Git cat-file returned an unexpected number of blobs.");
+  }
+  return blobs;
 }
 
 function parseLongTreeEntries(output: string): TreeEntryWithSize[] {

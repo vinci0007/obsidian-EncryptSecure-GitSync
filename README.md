@@ -1,22 +1,22 @@
 # 🔐 Secure Git Sync
 
-Secure Git Sync is an Obsidian desktop plugin for password-confirmed Git sync with encrypted remote note snapshots. It keeps your local vault readable, while the remote repository can store note content as AES-256-GCM encrypted objects.
+Secure Git Sync is an Obsidian desktop plugin for password-confirmed Git sync, optional encrypted remote note snapshots, and direct LAN vault sync.
 
 [中文说明](README.zh-CN.md)
 
 ## 🧭 What It Does
 
-Secure Git Sync is built for users who already trust Git as their backup and multi-device transport, but want a safer remote layout for private notes. The plugin can use a vault's existing `.git` repository, import existing local remotes, or add new remotes from common Git hosting providers.
+Secure Git Sync is built for users who already use Git to back up or move an Obsidian vault, but want stronger control over private notes and local-first workflows.
 
-The core workflow is simple:
+The plugin can:
 
-- Unlock the plugin with the administrator password.
-- Choose a configured remote.
-- Run pull, push, sync, or status from the Obsidian ribbon panel.
-- Keep local files plaintext and readable.
-- Store remote note snapshots encrypted when encryption is enabled.
+- Reuse an existing vault `.git` repository and import its configured remotes.
+- Add new remotes from common Git hosting providers or generic SSH/HTTPS URLs.
+- Keep local vault files readable as normal Markdown.
+- Store remote note snapshots as encrypted objects when encrypted sync is enabled.
+- Sync directly with another device on the same LAN without Git.
 
-## ✨ Feature Summary
+## ✅ Feature Summary
 
 - Password confirmation before push, pull, and sync operations.
 - Encrypted remote note snapshots enabled by default for new settings.
@@ -27,30 +27,31 @@ The core workflow is simple:
 - Pull, push, sync, status, conflict review, and conflict resolution UI.
 - Optional Obsidian settings sync.
 - Optional plugin runtime artifact sync with local plugin state excluded.
-- Administrator password wrapping with Argon2id for new keyrings.
-- PBKDF2 keyring compatibility for older configurations.
-- AES-256-GCM encrypted note objects and manifests.
-- Incremental note cache to avoid re-hashing unchanged files.
-- Limited-concurrency hash/encrypt pipeline for large vaults.
+- LAN sync for devices on the same Wi-Fi/LAN, with device discovery and manual target selection.
+- Incremental local change index under `.secure-git-sync/index/`.
+- Large local cache moved out of `data.json` into `.secure-git-sync/local-cache.json`.
+- Faster encrypted sync path using one remote session for pull and push.
+- Optional post-sync verification instead of mandatory full verification after every sync.
+- Batched Git object reads and limited-concurrency note processing for large vaults.
 - Sharded encrypted manifest support with legacy full-manifest compatibility.
-- Persistent internal Git cache under `.secure-git-sync/git-cache`.
 - Release artifacts generated only under `release/`.
 
 ## 🌟 What Makes It Different
 
-Secure Git Sync is not a hosted sync service. It is a local-first Obsidian plugin that uses the Git remotes you choose.
+Secure Git Sync is not a hosted sync service. It is a local-first Obsidian plugin that uses the Git remotes and devices you choose.
 
-Its most important distinction is the split between local usability and remote privacy:
+Its main split is local usability versus remote privacy:
 
 - Locally, your vault remains normal Markdown and normal Obsidian configuration.
-- Remotely, note files can be represented as encrypted objects and an encrypted manifest.
-- Git remains the transport layer, so you can use your own GitHub, GitLab, Gitee, GitCode, SSH, or self-hosted Git remote.
+- Remotely, note files can be represented as encrypted objects and encrypted manifests.
+- Git remains the transport layer for remote repositories.
+- LAN sync is available for direct device-to-device vault copy on trusted local networks.
 
 The plugin also tries to cooperate with existing Git workflows. If a vault already has remotes in `.git/config`, you can import and reuse them instead of forcing the plugin to recreate the remote setup.
 
 ## 🛡️ Encryption Model
 
-When encrypted sync is enabled, the remote repository stores notes in this layout:
+When encrypted Git sync is enabled, the remote repository stores notes in this layout:
 
 ```text
 .obsidian/                         # selected Obsidian settings, plaintext
@@ -69,47 +70,52 @@ The plugin uses a random 256-bit vault key for note content. The administrator p
 
 Each note object is encrypted with AES-256-GCM. The vault-relative path is used as authenticated additional data, binding encrypted content to its intended path.
 
+## 📡 LAN Sync
+
+LAN sync is designed for trusted devices on the same Wi-Fi or local network.
+
+- Disabled by default.
+- Does not use Git.
+- Does not encrypt transfer content by default.
+- Discovers nearby devices automatically and also supports manual refresh.
+- Lets you choose the target device before syncing.
+- Copies newer and missing files in both directions.
+- Does not propagate deletions yet, to avoid accidental destructive sync.
+
+Because LAN sync starts a local HTTP listener and UDP discovery listener, your operating system firewall may ask whether Obsidian can communicate on the local network.
+
 ## 🏗️ Architecture
 
-The plugin is organized around a few main parts:
+The plugin is organized around these modules:
 
-- `src/main.ts`: Obsidian plugin entry point, commands, setting tab, modals, operation panel, unlock flow, and user-visible progress.
-- `src/git.ts`: Git orchestration, encrypted push/pull, plaintext compatibility, conflict handling, remote import, file scanning, manifest management, and performance cache.
+- `src/main.ts`: Obsidian plugin entry point, commands, setting tab, modals, operation panel, unlock flow, progress UI, and LAN controls.
+- `src/git.ts`: Git orchestration, encrypted push/pull/sync, plaintext compatibility, conflict handling, remote import, manifest management, and performance cache.
+- `src/lan.ts`: Local network discovery, peer HTTP server, device manifest comparison, and direct file transfer.
 - `src/crypto.ts`: Password verification, key wrapping, key migration, AES-GCM encryption, decryption, and hashing helpers.
-- `src/providers.ts`: Hosted Git provider API integrations for repository browsing and creation.
-- `src/types.ts`: Settings, remotes, providers, password config, sync state, and cache types.
+- `src/providers.ts`: Hosted Git provider integrations for repository browsing and creation.
+- `src/types.ts`: Settings, remotes, providers, password config, sync state, cache types, and LAN settings.
 - `release/build-release.mjs`: Build and package script for release artifacts.
 
-The sync engine uses Git subprocesses, but guards command execution with an allowlist and path checks. It only runs Git inside the vault or the plugin's internal temporary/cache workspaces.
+The Git sync engine uses Git subprocesses, but guards command execution with an allowlist and path checks. Git is only run inside the vault or the plugin's internal temporary/cache workspaces.
 
 ## ⚙️ Runtime Flow
 
-Encrypted push:
+Encrypted sync now favors a single remote session:
 
-1. Ensure the vault has a Git repository and the selected remote is available.
-2. Fetch the remote branch into an internal Git workspace.
-3. Read the encrypted manifest, preferring sharded manifests and falling back to the legacy full manifest.
-4. Scan note paths.
-5. Reuse cached file hash and block metadata when size and mtime are unchanged.
-6. Hash and encrypt only changed notes with limited concurrency.
-7. Reuse unchanged remote encrypted objects.
-8. Write the updated manifest, shard index, and shards.
-9. Create a Git commit in the internal workspace and push it to the selected remote branch.
+1. Fetch the selected remote branch into the internal Git workspace.
+2. Read the encrypted manifest, preferring sharded manifests and falling back to the legacy full manifest.
+3. Use the local change index and cache to avoid unnecessary full note hashing.
+4. Hash and encrypt changed notes with limited concurrency.
+5. Read changed remote blobs in batches where possible.
+6. Apply pull-side changes and prepare push-side encrypted objects.
+7. Write the updated manifest, shard index, and shards.
+8. Commit and push the updated encrypted snapshot when needed.
 
-Encrypted pull:
+Expensive checks are now more selective:
 
-1. Fetch the selected remote branch.
-2. Read and decrypt the manifest.
-3. Compare local hashes with remote manifest entries, using local cache where possible.
-4. Decrypt only changed remote notes.
-5. Merge or apply files according to the selected conflict strategy.
-6. Save conflict copies when automatic merge is not safe.
-7. Update local note indexes and cache metadata.
-
-Plaintext compatibility:
-
-- If encryption is disabled, the plugin can still run ordinary Git push/pull flows.
-- If a remote already contains encrypted manifests, the plugin can auto-detect that and use encrypted handling.
+- Pre-sync difference inspection is skipped unless confirmation is enabled.
+- Post-sync remote consistency verification is optional and can be run manually.
+- The UI records stage timings so slow phases are easier to identify.
 
 ## 📦 Sync Scope
 
@@ -150,7 +156,7 @@ styles.css
 
 Then enable `Secure Git Sync` in Obsidian's Community plugins settings.
 
-## 🧰 Build And Release
+## 🧪 Build And Release
 
 Install dependencies:
 
@@ -183,9 +189,9 @@ release/secure-git-sync-<version>.sha256
 
 The repository root must not contain generated `main.js`. Build and release artifacts are kept under `release/`.
 
-## ![Buy Me a Coffee](assets/buy-me-a-coffee.png) Currently not available
+## ![Buy Me a Coffee](assets/buy-me-a-coffee.png) Buy Me a Coffee (Currently not available)
 
-If Secure Git Sync helps your Obsidian workflow, you can support ongoing development here:
+If Secure Git Sync helps your Obsidian workflow, support links are reserved here for future use:
 
 - [WeChat Pay](assets/wechat-pay-placeholder.svg)
 - [Alipay](assets/alipay-placeholder.svg)
@@ -194,4 +200,4 @@ Thank you for helping keep the plugin maintained, tested, and improved.
 
 ## 🤖 Automation
 
-GitHub Actions release automation lives at `.github/workflows/release.yml`. It can run manually, by pushing an `x.x.x` version tag such as `0.2.0`, or by changing the plugin version on `main`. The action builds the release package and publishes a GitHub Release for `<manifest.version>` when that release does not already exist.
+GitHub Actions release automation lives at `.github/workflows/release.yml`. It can run manually, by pushing an `x.x.x` version tag such as `0.2.1`, or by changing the plugin version on `main`. The action builds the release package and publishes a GitHub Release for `<manifest.version>` when that release does not already exist.

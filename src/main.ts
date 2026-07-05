@@ -7,11 +7,13 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  TFile,
 } from "obsidian";
 import { promises as fs } from "fs";
 import * as path from "path";
-import { createPasswordConfig, isUsernameRequired, randomId, rewrapPasswordConfig, shouldUpgradePasswordConfig, verifyPassword } from "./crypto";
+import { createPasswordConfig, isUsernameRequired, randomId, rewrapPasswordConfig, sha256Hex, shouldUpgradePasswordConfig, verifyPassword } from "./crypto";
 import { ConflictFileContent, ConflictFilePair, GitService, NoteConsistencyResult, PullResult, SyncCredential, validateRemoteConfig } from "./git";
+import { LanPeer, LanProgressEvent, LanSyncService } from "./lan";
 import { GitProviderClient, getProviderDefinition, PROVIDERS, ProviderRepo } from "./providers";
 import { DEFAULT_SETTINGS, DifferenceCounts, GitProgressEvent, GitProviderId, PasswordConfig, ProviderAccount, RemoteConfig, SecureGitSettings, SyncConflictResolution, SyncDifferenceSummary, UiLanguage } from "./types";
 
@@ -54,6 +56,10 @@ const TEXT = {
     noteTrashRetentionDaysDesc: "Days to keep notes moved to the Secure Git Sync trash. Use 0 to keep them forever.",
     confirmBeforeSyncDifferences: "Confirm differences before sync",
     confirmBeforeSyncDifferencesDesc: "When disabled, sync auto-merges notes, Obsidian settings, and plugins first. Conflicts are reported after sync.",
+    verifyAfterSync: "Verify notes after sync",
+    verifyAfterSyncDesc: "Off by default for speed. When enabled, each encrypted sync fetches the remote snapshot again and compares all local note hashes.",
+    verifyNow: "Verify now",
+    progressTimingSummary: "Timing",
     conflictRetentionDays: "Conflict copy retention",
     conflictRetentionDaysDesc: "Days to keep conflict copies. Use 0 to keep them forever.",
     remotes: "Remotes",
@@ -128,6 +134,7 @@ const TEXT = {
     pull: "Pull",
     push: "Push",
     sync: "Sync",
+    verify: "Verify",
     status: "Status",
     autoSync: "Auto sync",
     autoSyncDesc: "When enabled, Secure Git Sync runs at the configured interval while the panel unlock session is valid.",
@@ -135,6 +142,19 @@ const TEXT = {
     autoSyncIntervalDesc: "Interval in minutes. Minimum is 1 minute.",
     autoSyncUnlockDuration: "Auto sync unlock duration",
     autoSyncUnlockDurationDesc: "Defaults to the panel unlock duration. Choosing an independent duration requires the administrator password.",
+    lanSync: "LAN sync",
+    lanSyncDesc: "Sync this vault directly with devices on the same Wi-Fi/LAN. This mode does not use Git and is not encrypted.",
+    lanSyncEnabled: "Enable LAN sync",
+    lanDeviceName: "Device name",
+    lanDeviceNameDesc: "Shown to other devices during LAN discovery.",
+    lanPorts: "LAN ports",
+    lanPortsDesc: "Discovery and HTTP ports. Use the same discovery port on all devices.",
+    refreshLanDevices: "Refresh devices",
+    noLanDevices: "No LAN devices found.",
+    syncLanDevice: "Sync with device",
+    lanSyncCompleted: "LAN sync completed",
+    lanSyncFailed: "LAN sync failed",
+    lanDeleteNotice: "LAN sync copies newer and missing files, but does not propagate deletions yet.",
     proxy: "Proxy",
     proxyDesc: "Configure Git network proxy. Supports http, https, socks4, and socks5 URLs supported by Git.",
     proxyMode: "Proxy mode",
@@ -179,6 +199,7 @@ const TEXT = {
     syncCompleted: "Sync completed",
     pullCompleted: "Pull completed",
     pushCompleted: "Push completed",
+    verifyCompleted: "Verification completed",
     elapsed: "Elapsed",
     localPhase: "Local",
     networkPhase: "Network",
@@ -271,6 +292,10 @@ const TEXT = {
     noteTrashRetentionDaysDesc: "Secure Git Sync 垃圾箱中的笔记保留天数。填 0 表示永久保留。",
     confirmBeforeSyncDifferences: "同步前确认差异",
     confirmBeforeSyncDifferencesDesc: "关闭时会先自动合并笔记、Obsidian 配置与插件；如有冲突，同步后在面板中显示。",
+    verifyAfterSync: "同步后校验笔记",
+    verifyAfterSyncDesc: "默认关闭以提升速度。开启后，每次加密同步都会再次拉取远端快照并对比全部本地笔记 hash。",
+    verifyNow: "立即校验",
+    progressTimingSummary: "耗时",
     conflictRetentionDays: "冲突副本保留时间",
     conflictRetentionDaysDesc: "冲突副本保留天数。填 0 表示永久保留。",
     remotes: "远程仓库",
@@ -345,6 +370,7 @@ const TEXT = {
     pull: "拉取",
     push: "推送",
     sync: "同步",
+    verify: "校验",
     status: "状态",
     autoSync: "自动同步",
     autoSyncDesc: "开启后，Secure Git Sync 会按设定间隔弹出主管理员密码确认，再执行同步。",
@@ -352,6 +378,19 @@ const TEXT = {
     autoSyncIntervalDesc: "单位为分钟，最小 1 分钟。",
     autoSyncUnlockDuration: "自动同步解锁有效期",
     autoSyncUnlockDurationDesc: "默认与面板解锁有效期一致。选择独立有效期时，需要再次输入主管理员密码确认。",
+    lanSync: "局域网同步",
+    lanSyncDesc: "与同一 Wi-Fi/局域网内的设备直接同步当前 vault。此模式不使用 Git，默认不加密。",
+    lanSyncEnabled: "启用局域网同步",
+    lanDeviceName: "设备名称",
+    lanDeviceNameDesc: "用于在局域网发现中显示给其他设备。",
+    lanPorts: "局域网端口",
+    lanPortsDesc: "发现端口和 HTTP 端口。所有设备建议使用相同发现端口。",
+    refreshLanDevices: "刷新设备",
+    noLanDevices: "未发现局域网设备。",
+    syncLanDevice: "同步到此设备",
+    lanSyncCompleted: "局域网同步完成",
+    lanSyncFailed: "局域网同步失败",
+    lanDeleteNotice: "局域网同步会复制较新和缺失文件，暂不传播删除操作。",
     proxy: "代理",
     proxyDesc: "配置 Git 网络代理。支持 Git 可识别的 http、https、socks4、socks5 URL。",
     proxyMode: "代理模式",
@@ -396,6 +435,7 @@ const TEXT = {
     syncCompleted: "同步完成",
     pullCompleted: "拉取完成",
     pushCompleted: "推送完成",
+    verifyCompleted: "校验完成",
     elapsed: "耗时",
     localPhase: "本地",
     networkPhase: "网络",
@@ -465,7 +505,7 @@ function addAutoSyncDurationOptions(dropdown: DropdownComponent, language: UiLan
   }
 }
 
-type OperationMode = "push" | "pull" | "sync";
+type OperationMode = "push" | "pull" | "sync" | "verify";
 type OperationStateKind = "idle" | "running" | "completed" | "failed";
 
 interface UnlockSession {
@@ -486,6 +526,268 @@ interface OperationState {
   conflictDirs?: string[];
 }
 
+interface LocalSyncCache {
+  noteFileList?: string[];
+  noteBlockIndex?: SecureGitSettings["noteBlockIndex"];
+  noteFileCache?: SecureGitSettings["noteFileCache"];
+}
+
+type SyncQueueKind = "M" | "C" | "D" | "R";
+
+interface SyncQueueOp {
+  kind: SyncQueueKind;
+  id: string;
+  path?: string;
+  oldPath?: string;
+  newPath?: string;
+}
+
+class LocalChangeIndex {
+  private readonly indexRoot: string;
+  private readonly syncOpsPath: string;
+  private loaded = false;
+  private flushTimer: number | null = null;
+  private readonly ops = new Map<string, SyncQueueOp>();
+  private revision = 0;
+  private lastSnapshotRevision = 0;
+  private lastSnapshotOps = new Map<string, string>();
+
+  constructor(private readonly vaultPath: string, private readonly configDir: string) {
+    this.indexRoot = path.join(vaultPath, ".secure-git-sync", "index");
+    this.syncOpsPath = path.join(this.indexRoot, "sync.ops");
+  }
+
+  async recordCreated(filePath: string): Promise<void> {
+    const normalized = normalizeIndexPath(filePath);
+    if (!this.shouldTrack(normalized)) {
+      return;
+    }
+    const id = await this.ensureIdForPath(normalized);
+    await this.mergeOp({ kind: "C", id, path: normalized });
+  }
+
+  async recordModified(filePath: string): Promise<void> {
+    const normalized = normalizeIndexPath(filePath);
+    if (!this.shouldTrack(normalized)) {
+      return;
+    }
+    const id = await this.ensureIdForPath(normalized);
+    await this.mergeOp({ kind: "M", id });
+  }
+
+  async recordDeleted(filePath: string): Promise<void> {
+    const normalized = normalizeIndexPath(filePath);
+    if (!this.shouldTrack(normalized)) {
+      return;
+    }
+    const id = await this.ensureIdForPath(normalized);
+    await this.mergeOp({ kind: "D", id });
+  }
+
+  async recordRenamed(oldPath: string, newPath: string): Promise<void> {
+    const oldNormalized = normalizeIndexPath(oldPath);
+    const newNormalized = normalizeIndexPath(newPath);
+    if (!this.shouldTrack(oldNormalized) && !this.shouldTrack(newNormalized)) {
+      return;
+    }
+    const id = await this.moveIdToPath(oldNormalized, newNormalized);
+    await this.mergeOp({ kind: "R", id, oldPath: oldNormalized, newPath: newNormalized });
+  }
+
+  async changedPathsForSync(): Promise<string[]> {
+    await this.flushNow();
+    await this.ensureLoaded();
+    this.lastSnapshotRevision = this.revision;
+    this.lastSnapshotOps = new Map(Array.from(this.ops.entries()).map(([id, op]) => [id, formatSyncQueueLine(op)]));
+    const paths: string[] = [];
+    for (const op of this.ops.values()) {
+      if (op.kind === "C" && op.path) {
+        paths.push(op.path);
+      } else if (op.kind === "R") {
+        if (op.oldPath) {
+          paths.push(op.oldPath);
+        }
+        if (op.newPath) {
+          paths.push(op.newPath);
+        }
+      } else {
+        const resolved = await this.pathForId(op.id);
+        if (resolved) {
+          paths.push(resolved);
+        }
+      }
+    }
+    return Array.from(new Set(paths.map(normalizeIndexPath).filter(Boolean))).sort();
+  }
+
+  async clearSynced(): Promise<void> {
+    if (this.flushTimer !== null) {
+      window.clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.loaded = true;
+    for (const [id, snapshotLine] of this.lastSnapshotOps.entries()) {
+      const current = this.ops.get(id);
+      if (current && formatSyncQueueLine(current) === snapshotLine) {
+        this.ops.delete(id);
+      }
+    }
+    this.revision += 1;
+    await fs.mkdir(path.dirname(this.syncOpsPath), { recursive: true });
+    await this.writeOps();
+  }
+
+  private shouldTrack(filePath: string): boolean {
+    if (!filePath) {
+      return false;
+    }
+    const firstSegment = filePath.split("/")[0];
+    if ([".git", ".secure-git-sync", ".secure-git-sync-conflicts", ".secure-git-sync-trash"].includes(firstSegment)) {
+      return false;
+    }
+    const ownPluginRoot = `${normalizeIndexPath(this.configDir)}/plugins/secure-git-sync`;
+    const ownPluginAliasRoot = `${normalizeIndexPath(this.configDir)}/plugins/obsidian-secure-git-sync`;
+    return filePath !== `${ownPluginRoot}/data.json`
+      && filePath !== `${ownPluginRoot}/cache.json`
+      && filePath !== `${ownPluginAliasRoot}/data.json`
+      && filePath !== `${ownPluginAliasRoot}/cache.json`;
+  }
+
+  private async mergeOp(next: SyncQueueOp): Promise<void> {
+    await this.ensureLoaded();
+    const existing = this.ops.get(next.id);
+    if (!existing) {
+      this.ops.set(next.id, next);
+      this.revision += 1;
+      this.scheduleFlush();
+      return;
+    }
+    if (next.kind === "D" && existing.kind === "C") {
+      this.ops.delete(next.id);
+    } else if (next.kind === "M" && (existing.kind === "C" || existing.kind === "R")) {
+      this.ops.set(next.id, existing);
+    } else if (next.kind === "R" && existing.kind === "C") {
+      this.ops.set(next.id, { ...existing, path: next.newPath });
+    } else {
+      this.ops.set(next.id, next);
+    }
+    this.revision += 1;
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer !== null) {
+      window.clearTimeout(this.flushTimer);
+    }
+    this.flushTimer = window.setTimeout(() => {
+      this.flushTimer = null;
+      void this.writeOps();
+    }, 1500);
+  }
+
+  private async flushNow(): Promise<void> {
+    if (this.flushTimer !== null) {
+      window.clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+      await this.writeOps();
+    }
+  }
+
+  private async ensureLoaded(): Promise<void> {
+    if (this.loaded) {
+      return;
+    }
+    this.loaded = true;
+    this.ops.clear();
+    try {
+      const contents = await fs.readFile(this.syncOpsPath, "utf8");
+      for (const line of contents.split(/\r?\n/)) {
+        const op = parseSyncQueueLine(line);
+        if (op) {
+          this.ops.set(op.id, op);
+        }
+      }
+    } catch {
+      // Missing or unreadable queue files are treated as an empty queue.
+    }
+  }
+
+  private async writeOps(): Promise<void> {
+    await fs.mkdir(path.dirname(this.syncOpsPath), { recursive: true });
+    const lines = Array.from(this.ops.values()).map(formatSyncQueueLine);
+    await fs.writeFile(this.syncOpsPath, lines.length > 0 ? `${lines.join("\n")}\n` : "", "utf8");
+  }
+
+  private async ensureIdForPath(filePath: string): Promise<string> {
+    const pathShard = await this.readPathShard(filePath);
+    const encoded = encodeIndexField(filePath);
+    const existing = pathShard.get(encoded);
+    if (existing) {
+      return existing;
+    }
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const id = randomId().slice(0, 10);
+      const idShard = await this.readIdShard(id);
+      if (!idShard.has(id)) {
+        pathShard.set(encoded, id);
+        idShard.set(id, encoded);
+        await this.writePathShard(filePath, pathShard);
+        await this.writeIdShard(id, idShard);
+        return id;
+      }
+    }
+    throw new Error("Unable to allocate a unique local file id.");
+  }
+
+  private async moveIdToPath(oldPath: string, newPath: string): Promise<string> {
+    const id = await this.ensureIdForPath(oldPath);
+    const oldEncoded = encodeIndexField(oldPath);
+    const newEncoded = encodeIndexField(newPath);
+    const oldPathShard = await this.readPathShard(oldPath);
+    oldPathShard.delete(oldEncoded);
+    await this.writePathShard(oldPath, oldPathShard);
+
+    const newPathShard = oldPath === newPath ? oldPathShard : await this.readPathShard(newPath);
+    newPathShard.set(newEncoded, id);
+    await this.writePathShard(newPath, newPathShard);
+
+    const idShard = await this.readIdShard(id);
+    idShard.set(id, newEncoded);
+    await this.writeIdShard(id, idShard);
+    return id;
+  }
+
+  private async pathForId(id: string): Promise<string | null> {
+    const shard = await this.readIdShard(id);
+    const encoded = shard.get(id);
+    return encoded ? decodeIndexField(encoded) : null;
+  }
+
+  private async readPathShard(filePath: string): Promise<Map<string, string>> {
+    return readTabMap(this.pathShardPath(filePath));
+  }
+
+  private async writePathShard(filePath: string, values: Map<string, string>): Promise<void> {
+    await writeTabMap(this.pathShardPath(filePath), values);
+  }
+
+  private async readIdShard(id: string): Promise<Map<string, string>> {
+    return readTabMap(this.idShardPath(id));
+  }
+
+  private async writeIdShard(id: string, values: Map<string, string>): Promise<void> {
+    await writeTabMap(this.idShardPath(id), values);
+  }
+
+  private pathShardPath(filePath: string): string {
+    return path.join(this.indexRoot, "dict", "path-to-id", `${sha256Hex(filePath).slice(0, 2)}.idx`);
+  }
+
+  private idShardPath(id: string): string {
+    return path.join(this.indexRoot, "dict", "id-to-path", `${id.slice(0, 2)}.idx`);
+  }
+}
+
 const UNLOCK_DURATIONS = [
   { key: "oneTime", value: "one-time", minutes: 0 },
   { key: "fiveMinutes", value: "5", minutes: 5 },
@@ -502,6 +804,8 @@ const UNLOCK_DURATIONS = [
 export default class SecureGitSyncPlugin extends Plugin {
   settings: SecureGitSettings = DEFAULT_SETTINGS;
   private git!: GitService;
+  private lan!: LanSyncService;
+  private changeIndex!: LocalChangeIndex;
   private autoSyncIntervalId: number | null = null;
   private autoSyncRunning = false;
   private unlockSession: UnlockSession | null = null;
@@ -510,12 +814,31 @@ export default class SecureGitSyncPlugin extends Plugin {
   private operationRunning = false;
   private lastConflictCopies = 0;
   private lastConflictDirs: string[] = [];
+  private operationPhaseTotals = new Map<GitProgressEvent["phase"], number>();
 
   async onload(): Promise<void> {
     const loadedData: unknown = await this.loadData();
-    this.settings = { ...DEFAULT_SETTINGS, ...(isSecureGitSettings(loadedData) ? loadedData : {}) };
+    const loadedSettings = isSecureGitSettings(loadedData) ? loadedData : {};
+    const localCache = await this.loadLocalSyncCache();
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...loadedSettings,
+      noteFileList: localCache.noteFileList ?? loadedSettings.noteFileList ?? DEFAULT_SETTINGS.noteFileList,
+      noteBlockIndex: localCache.noteBlockIndex ?? loadedSettings.noteBlockIndex ?? DEFAULT_SETTINGS.noteBlockIndex,
+      noteFileCache: localCache.noteFileCache ?? loadedSettings.noteFileCache ?? DEFAULT_SETTINGS.noteFileCache,
+    };
+    if (!this.settings.lanDeviceId) {
+      this.settings.lanDeviceId = randomId().slice(0, 12);
+    }
+    if (!this.settings.lanDeviceName) {
+      this.settings.lanDeviceName = defaultLanDeviceName();
+    }
     this.git = new GitService(this.getVaultPath(), this.app.vault.configDir);
+    this.lan = new LanSyncService(this.getVaultPath(), this.app.vault.configDir);
+    this.changeIndex = new LocalChangeIndex(this.getVaultPath(), this.app.vault.configDir);
     await applyElectronProxy(this.settings);
+    await this.restartLanSync();
+    this.registerFileChangeIndex();
 
     this.addCommand({
       id: "push",
@@ -583,8 +906,117 @@ export default class SecureGitSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const { noteFileList, noteBlockIndex, noteFileCache, ...settingsData } = this.settings;
+    await this.saveLocalSyncCache({ noteFileList, noteBlockIndex, noteFileCache });
+    await this.saveData(settingsData);
     await applyElectronProxy(this.settings);
+  }
+
+  async restartLanSync(): Promise<void> {
+    await this.lan.stop();
+    await this.lan.start({
+      lanSyncEnabled: this.settings.lanSyncEnabled,
+      lanDeviceId: this.settings.lanDeviceId,
+      lanDeviceName: this.settings.lanDeviceName || defaultLanDeviceName(),
+      lanDiscoveryPort: this.settings.lanDiscoveryPort,
+      lanHttpPort: this.settings.lanHttpPort,
+    });
+  }
+
+  async refreshLanPeers(): Promise<LanPeer[]> {
+    await this.lan.refresh();
+    await delay(600);
+    return this.lan.peers();
+  }
+
+  lanPeers(): LanPeer[] {
+    return this.lan.peers();
+  }
+
+  async runLanSync(peer: LanPeer): Promise<void> {
+    if (this.operationRunning) {
+      new Notice(this.text("operationBusy"));
+      return;
+    }
+    this.operationRunning = true;
+    this.operationPhaseTotals = new Map();
+    const startedAt = Date.now();
+    this.setOperationState({
+      kind: "running",
+      message: `${this.text("lanSync")}: ${peer.name}`,
+      startedAt,
+      details: [this.text("lanDeleteNotice")],
+    });
+    try {
+      const summary = await this.lan.syncWith(peer, (event) => this.handleLanProgress(event));
+      const finalSummary = `${this.text("lanSyncCompleted")}. ${this.text("elapsed")}: ${formatDuration(Date.now() - startedAt)}. ${summary}`;
+      this.settings.lastSyncAt = new Date().toISOString();
+      this.settings.lastSyncSummary = finalSummary;
+      await this.saveSettings();
+      this.setOperationState({
+        ...this.operationState,
+        kind: "completed",
+        message: finalSummary,
+        finishedAt: Date.now(),
+      });
+      new Notice(finalSummary);
+    } catch (error) {
+      const message = `${this.text("lanSyncFailed")}: ${formatError(error)}`;
+      this.setOperationState({
+        ...this.operationState,
+        kind: "failed",
+        message,
+        finishedAt: Date.now(),
+      });
+      new Notice(message);
+    } finally {
+      this.operationRunning = false;
+    }
+  }
+
+  async onunload(): Promise<void> {
+    await this.lan?.stop();
+  }
+
+  private registerFileChangeIndex(): void {
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (file instanceof TFile) {
+        void this.changeIndex.recordCreated(file.path);
+      }
+    }));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file instanceof TFile) {
+        void this.changeIndex.recordModified(file.path);
+      }
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (file instanceof TFile) {
+        void this.changeIndex.recordDeleted(file.path);
+      }
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFile) {
+        void this.changeIndex.recordRenamed(oldPath, file.path);
+      }
+    }));
+  }
+
+  private localSyncCachePath(): string {
+    return path.join(this.getVaultPath(), ".secure-git-sync", "local-cache.json");
+  }
+
+  private async loadLocalSyncCache(): Promise<LocalSyncCache> {
+    try {
+      return JSON.parse(await fs.readFile(this.localSyncCachePath(), "utf8")) as LocalSyncCache;
+    } catch {
+      return {};
+    }
+  }
+
+  private async saveLocalSyncCache(cache: LocalSyncCache): Promise<void> {
+    const cachePath = this.localSyncCachePath();
+    await fs.mkdir(path.dirname(cachePath), { recursive: true });
+    await fs.writeFile(cachePath, `${JSON.stringify(cache)}\n`, "utf8");
   }
 
   language(): UiLanguage {
@@ -670,6 +1102,7 @@ export default class SecureGitSyncPlugin extends Plugin {
     }
 
     this.operationRunning = true;
+    this.operationPhaseTotals = new Map();
     const startedAt = Date.now();
     this.setOperationState({
       kind: "running",
@@ -964,7 +1397,7 @@ export default class SecureGitSyncPlugin extends Plugin {
     ).open();
   }
 
-  async runPasswordProtected(mode: "push" | "pull" | "sync"): Promise<void> {
+  async runPasswordProtected(mode: OperationMode): Promise<void> {
     if (!this.settings.password) {
       new Notice(this.text("createPasswordFirst"));
       this.openPasswordSetup();
@@ -1056,8 +1489,19 @@ export default class SecureGitSyncPlugin extends Plugin {
       const progress = (event: GitProgressEvent) => this.handleGitProgress(event);
       let summary = "";
       let pullResult: PullResult | null = null;
+      const queuedChangedFiles = mode === "sync" || mode === "push"
+        ? await this.changeIndex.changedPathsForSync()
+        : [];
+      if (queuedChangedFiles.length > 0) {
+        progress({ phase: "local", kind: "info", message: `${queuedChangedFiles.length} queued local changes` });
+      }
 
-      if (mode === "pull") {
+      if (mode === "verify") {
+        const verification = await this.verifyRemoteNoteConsistency(remote, cryptoKey, progress);
+        summary = verification.consistent
+          ? this.text("noteConsistencyOk")
+          : `${this.text("noteConsistencyFailed")} ${verification.localOnly} local only, ${verification.remoteOnly} remote only, ${verification.modified} modified.`;
+      } else if (mode === "pull") {
         const pullPlan = await this.prepareSyncPlan(remote, cryptoKey, progress);
         if (!pullPlan) {
           this.setOperationState({
@@ -1078,7 +1522,7 @@ export default class SecureGitSyncPlugin extends Plugin {
         }
         summary = pullResult.summary;
       } else if (mode === "push") {
-        summary = await this.git.push(remote, this.settings, cryptoKey, progress, { includePlugins: true, credential });
+        summary = await this.git.push(remote, this.settings, cryptoKey, progress, { includePlugins: true, credential, queuedChangedFiles });
       } else {
         const syncPlan = await this.prepareSyncPlan(remote, cryptoKey, progress);
         if (!syncPlan) {
@@ -1090,7 +1534,8 @@ export default class SecureGitSyncPlugin extends Plugin {
           });
           return;
         }
-        pullResult = await this.git.pull(remote, this.settings, cryptoKey, progress, syncPlan.resolution, credential);
+        const syncResult = await this.git.sync(remote, this.settings, cryptoKey, progress, syncPlan.resolution, syncPlan.includePlugins, credential, queuedChangedFiles);
+        pullResult = syncResult;
         if (pullResult.remoteEncrypted && !this.settings.encryptionEnabled) {
           this.settings.encryptionEnabled = true;
         }
@@ -1098,16 +1543,7 @@ export default class SecureGitSyncPlugin extends Plugin {
           cryptoKey = pullResult.key;
           this.unlockSession.key = pullResult.key;
         }
-        if (pullResult.conflictCopies > 0 || pullResult.conflictDirs.length > 0) {
-          progress({ phase: "local", kind: "info", message: "conflicts require manual resolution before push" });
-          summary = `${pullResult.summary} Resolve conflicts before pushing.`;
-        } else if (!pullResult.plaintextChanged && !(await this.git.hasLocalPlaintextChanges(syncPlan.includePlugins))) {
-          progress({ phase: "local", kind: "info", message: "no local changes to push" });
-          summary = `${pullResult.summary} No local changes to push.`;
-        } else {
-          const pushSummary = await this.git.push(remote, this.settings, cryptoKey, progress, { includePlugins: syncPlan.includePlugins || pullResult.remoteEncrypted, credential });
-          summary = `${pullResult.summary} ${pushSummary}`;
-        }
+        summary = `${pullResult.summary} ${syncResult.pushSummary}`;
       }
 
       const elapsedMs = Date.now() - startedAt;
@@ -1119,16 +1555,20 @@ export default class SecureGitSyncPlugin extends Plugin {
         ? ` ${this.text("conflictCopies")}: ${pullResult.conflictCopies}.`
         : "";
       let verificationSummary = "";
-      if (pullResult && this.settings.encryptionEnabled) {
+      if (pullResult && this.settings.encryptionEnabled && this.settings.verifyAfterSync) {
         const verification = await this.verifyRemoteNoteConsistency(remote, cryptoKey, progress);
         verificationSummary = verification.consistent
           ? ` ${this.text("noteConsistencyOk")}`
           : ` ${this.text("noteConsistencyFailed")} ${verification.localOnly} local only, ${verification.remoteOnly} remote only, ${verification.modified} modified.`;
       }
-      const finalSummary = `${this.text(`${mode}Completed` as TextKey)}. ${this.text("elapsed")}: ${formatDuration(elapsedMs)}.${conflictSummary}${verificationSummary} ${summary}`;
+      const timingSummary = this.formatProgressTimingSummary();
+      const finalSummary = `${this.text(`${mode}Completed` as TextKey)}. ${this.text("elapsed")}: ${formatDuration(elapsedMs)}.${conflictSummary}${verificationSummary}${timingSummary} ${summary}`;
       this.settings.lastSyncAt = new Date().toISOString();
       this.settings.lastSyncSummary = finalSummary;
       await this.saveSettings();
+      if ((mode === "sync" || mode === "push") && (!pullResult || (pullResult.conflictCopies === 0 && pullResult.conflictDirs.length === 0))) {
+        await this.changeIndex.clearSynced();
+      }
       this.setOperationState({
         ...this.operationState,
         kind: "completed",
@@ -1168,11 +1608,42 @@ export default class SecureGitSyncPlugin extends Plugin {
     if (event.kind === "end" || event.kind === "info") {
       details.push(line);
     }
+    if (event.kind === "end" && event.elapsedMs !== undefined) {
+      this.operationPhaseTotals.set(event.phase, (this.operationPhaseTotals.get(event.phase) ?? 0) + event.elapsedMs);
+    }
     this.setOperationState({
       ...this.operationState,
       message: line,
       details: details.slice(-10),
     });
+  }
+
+  private handleLanProgress(event: LanProgressEvent): void {
+    const phaseName = event.phase === "scan"
+      ? this.text("localPhase")
+      : event.phase === "network"
+        ? this.text("networkPhase")
+        : this.text("gitPhase");
+    const line = event.elapsedMs === undefined
+      ? `${phaseName}: ${event.message}`
+      : `${phaseName}: ${event.message} (${formatDuration(event.elapsedMs)})`;
+    const details = [...this.operationState.details, line].slice(-10);
+    this.setOperationState({
+      ...this.operationState,
+      message: line,
+      details,
+    });
+  }
+
+  private formatProgressTimingSummary(): string {
+    const parts: string[] = [];
+    for (const phase of ["network", "local", "crypto", "git"] as const) {
+      const elapsed = this.operationPhaseTotals.get(phase) ?? 0;
+      if (elapsed > 0) {
+        parts.push(`${t(this.language(), `${phase}Phase` as TextKey)} ${formatDuration(elapsed)}`);
+      }
+    }
+    return parts.length > 0 ? ` ${this.text("progressTimingSummary")}: ${parts.join("; ")}.` : "";
   }
 
   private async prepareSyncPlan(
@@ -1184,6 +1655,13 @@ export default class SecureGitSyncPlugin extends Plugin {
       return {
         resolution: { notes: "merge", obsidian: "merge", plugins: "merge" },
         includePlugins: false,
+      };
+    }
+    if (!this.settings.confirmBeforeSyncDifferences) {
+      progress({ phase: "local", kind: "info", message: "skipped pre-sync difference scan" });
+      return {
+        resolution: { notes: "merge", obsidian: "merge", plugins: "merge" },
+        includePlugins: true,
       };
     }
 
@@ -1373,6 +1851,80 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName(t(language, "lanSync"))
+      .setDesc(t(language, "lanSyncDesc"))
+      .setHeading();
+
+    new Setting(containerEl)
+      .setName(t(language, "lanSyncEnabled"))
+      .setDesc(t(language, "lanDeleteNotice"))
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.lanSyncEnabled)
+        .onChange(async (value) => {
+          this.plugin.settings.lanSyncEnabled = value;
+          await this.plugin.saveSettings();
+          await this.plugin.restartLanSync();
+          this.display();
+        }));
+
+    new Setting(containerEl)
+      .setName(t(language, "lanDeviceName"))
+      .setDesc(t(language, "lanDeviceNameDesc"))
+      .addText((text) => text
+        .setValue(this.plugin.settings.lanDeviceName)
+        .onChange(async (value) => {
+          this.plugin.settings.lanDeviceName = value.trim() || defaultLanDeviceName();
+          await this.plugin.saveSettings();
+          await this.plugin.restartLanSync();
+        }));
+
+    new Setting(containerEl)
+      .setName(t(language, "lanPorts"))
+      .setDesc(t(language, "lanPortsDesc"))
+      .addText((text) => text
+        .setPlaceholder("37918")
+        .setValue(String(this.plugin.settings.lanDiscoveryPort))
+        .onChange(async (value) => {
+          this.plugin.settings.lanDiscoveryPort = Math.max(1, Math.floor(Number(value) || 37918));
+          await this.plugin.saveSettings();
+          await this.plugin.restartLanSync();
+        }))
+      .addText((text) => text
+        .setPlaceholder("37919")
+        .setValue(String(this.plugin.settings.lanHttpPort))
+        .onChange(async (value) => {
+          this.plugin.settings.lanHttpPort = Math.max(1, Math.floor(Number(value) || 37919));
+          await this.plugin.saveSettings();
+          await this.plugin.restartLanSync();
+        }));
+
+    new Setting(containerEl)
+      .setName(t(language, "refreshLanDevices"))
+      .addButton((button) => button
+        .setButtonText(t(language, "refreshLanDevices"))
+        .onClick(async () => {
+          await this.plugin.refreshLanPeers();
+          this.display();
+        }));
+
+    const lanPeers = this.plugin.lanPeers();
+    if (this.plugin.settings.lanSyncEnabled && lanPeers.length === 0) {
+      new Setting(containerEl)
+        .setName(t(language, "noLanDevices"));
+    }
+    for (const peer of lanPeers) {
+      new Setting(containerEl)
+        .setName(peer.name)
+        .setDesc(`${peer.host}:${peer.port}`)
+        .addButton((button) => button
+          .setButtonText(t(language, "syncLanDevice"))
+          .setCta()
+          .onClick(() => {
+            void this.plugin.runLanSync(peer);
+          }));
+    }
+
+    new Setting(containerEl)
       .setName(t(language, "changeAdminPassword"))
       .addButton((button) => button
         .setButtonText(t(language, "change"))
@@ -1418,6 +1970,21 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
         .onChange(async (value) => {
           this.plugin.settings.confirmBeforeSyncDifferences = value;
           await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName(t(language, "verifyAfterSync"))
+      .setDesc(t(language, "verifyAfterSyncDesc"))
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.verifyAfterSync)
+        .onChange(async (value) => {
+          this.plugin.settings.verifyAfterSync = value;
+          await this.plugin.saveSettings();
+        }))
+      .addButton((button) => button
+        .setButtonText(t(language, "verifyNow"))
+        .onClick(() => {
+          void this.plugin.runPasswordProtected("verify");
         }));
 
     new Setting(containerEl)
@@ -2927,6 +3494,75 @@ function isSecureGitSettings(value: unknown): value is Partial<SecureGitSettings
   return typeof value === "object" && value !== null;
 }
 
+function normalizeIndexPath(filePath: string): string {
+  return filePath.replace(/\\/g, "/").replace(/^\/+/, "");
+}
+
+function encodeIndexField(value: string): string {
+  return encodeURIComponent(normalizeIndexPath(value));
+}
+
+function decodeIndexField(value: string): string {
+  return normalizeIndexPath(decodeURIComponent(value));
+}
+
+function formatSyncQueueLine(op: SyncQueueOp): string {
+  if (op.kind === "C" && op.path) {
+    return `C\t${op.id}\t${encodeIndexField(op.path)}`;
+  }
+  if (op.kind === "R" && op.oldPath && op.newPath) {
+    return `R\t${op.id}\t${encodeIndexField(op.oldPath)}\t${encodeIndexField(op.newPath)}`;
+  }
+  return `${op.kind}\t${op.id}`;
+}
+
+function parseSyncQueueLine(line: string): SyncQueueOp | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed === "FULL_RESCAN") {
+    return null;
+  }
+  const [kind, id, firstPath, secondPath] = trimmed.split("\t");
+  if (!isSyncQueueKind(kind) || !/^[0-9a-f]{6,16}$/i.test(id ?? "")) {
+    return null;
+  }
+  if (kind === "C" && firstPath) {
+    return { kind, id, path: decodeIndexField(firstPath) };
+  }
+  if (kind === "R" && firstPath && secondPath) {
+    return { kind, id, oldPath: decodeIndexField(firstPath), newPath: decodeIndexField(secondPath) };
+  }
+  return { kind, id };
+}
+
+function isSyncQueueKind(value: string): value is SyncQueueKind {
+  return value === "M" || value === "C" || value === "D" || value === "R";
+}
+
+async function readTabMap(filePath: string): Promise<Map<string, string>> {
+  const values = new Map<string, string>();
+  try {
+    const contents = await fs.readFile(filePath, "utf8");
+    for (const line of contents.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+      const [key, value] = line.split("\t");
+      if (key && value) {
+        values.set(key, value);
+      }
+    }
+  } catch {
+    // Missing dictionary shards are created lazily.
+  }
+  return values;
+}
+
+async function writeTabMap(filePath: string, values: Map<string, string>): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const lines = Array.from(values.entries()).sort(([left], [right]) => left.localeCompare(right)).map(([key, value]) => `${key}\t${value}`);
+  await fs.writeFile(filePath, lines.length > 0 ? `${lines.join("\n")}\n` : "", "utf8");
+}
+
 function formatDuration(ms: number): string {
   if (ms < 1000) {
     return `${ms}ms`;
@@ -2938,6 +3574,14 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.round(seconds - minutes * 60);
   return `${minutes}m${rest}s`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function defaultLanDeviceName(): string {
+  return `Obsidian ${new Date().getFullYear()}`;
 }
 
 function hasCategoryDifferences(counts: DifferenceCounts): boolean {

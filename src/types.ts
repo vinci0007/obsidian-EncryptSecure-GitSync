@@ -60,16 +60,23 @@ export interface SecureGitSettings {
   commitMessageTemplate: string;
   deleteMissingFilesOnPull: boolean;
   confirmBeforeSyncDifferences: boolean;
+  verifyAfterSync: boolean;
   conflictRetentionDays: number;
   noteTrashRetentionDays: number;
   autoSyncEnabled: boolean;
   autoSyncIntervalMinutes: number;
   autoSyncUnlockDuration: string;
+  lanSyncEnabled: boolean;
+  lanDeviceId: string;
+  lanDeviceName: string;
+  lanDiscoveryPort: number;
+  lanHttpPort: number;
   proxyMode: ProxyMode;
   proxyUrl: string;
   proxyNoProxy: string;
   lastSyncAt: string;
   lastSyncSummary: string;
+  noteFileList: string[];
   noteBlockIndex: Record<string, NoteFileBlockIndex>;
   noteFileCache: Record<string, NoteFileCacheEntry>;
 }
@@ -86,16 +93,23 @@ export const DEFAULT_SETTINGS: SecureGitSettings = {
   commitMessageTemplate: "Secure Git Sync: {{date}}",
   deleteMissingFilesOnPull: false,
   confirmBeforeSyncDifferences: false,
+  verifyAfterSync: false,
   conflictRetentionDays: 30,
   noteTrashRetentionDays: 30,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 30,
   autoSyncUnlockDuration: "same-as-panel",
+  lanSyncEnabled: false,
+  lanDeviceId: "",
+  lanDeviceName: "",
+  lanDiscoveryPort: 37918,
+  lanHttpPort: 37919,
   proxyMode: "off",
   proxyUrl: "",
   proxyNoProxy: "",
   lastSyncAt: "",
   lastSyncSummary: "",
+  noteFileList: [],
   noteBlockIndex: {},
   noteFileCache: {},
 };

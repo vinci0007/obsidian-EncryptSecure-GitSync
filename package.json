@@ -1,6 +1,6 @@
 {
   "name": "obsidian-secure-git-sync",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Password-confirmed Git sync for Obsidian with optional note-only encryption.",
   "main": "main.js",
   "scripts": {
