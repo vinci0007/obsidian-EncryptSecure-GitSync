@@ -7,6 +7,7 @@ const banner =
 
 const prod = process.argv[2] === "production";
 const builtins = [...new Set(builtinModules.flatMap((name) => name.startsWith("node:") ? [name] : [name, `node:${name}`]))];
+const outfile = process.env.SECURE_GIT_SYNC_OUTFILE || "release/build/main.js";
 
 await esbuild.build({
   banner: {
@@ -35,6 +36,6 @@ await esbuild.build({
   logLevel: "info",
   sourcemap: prod ? false : "inline",
   treeShaking: true,
-  outfile: "main.js",
+  outfile,
   minify: prod,
 });

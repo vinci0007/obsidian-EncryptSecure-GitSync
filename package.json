@@ -1,10 +1,10 @@
 {
   "name": "obsidian-secure-git-sync",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Password-confirmed Git sync for Obsidian with optional note-only encryption.",
   "main": "main.js",
   "scripts": {
-    "build": "node esbuild.config.mjs production",
+    "build": "node release/build-release.mjs --skip-zip",
     "dev": "node esbuild.config.mjs",
     "release": "node release/build-release.mjs"
   },

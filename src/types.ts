@@ -4,6 +4,8 @@ export interface RemoteConfig {
   url: string;
   branch: string;
   providerAccountId?: string;
+  useLocalGitConfig?: boolean;
+  urlCount?: number;
 }
 
 export type UiLanguage = "zh" | "en";
@@ -69,11 +71,12 @@ export interface SecureGitSettings {
   lastSyncAt: string;
   lastSyncSummary: string;
   noteBlockIndex: Record<string, NoteFileBlockIndex>;
+  noteFileCache: Record<string, NoteFileCacheEntry>;
 }
 
 export const DEFAULT_SETTINGS: SecureGitSettings = {
   uiLanguage: null,
-  encryptionEnabled: false,
+  encryptionEnabled: true,
   activeRemoteId: "",
   remotes: [],
   providerAccounts: [],
@@ -94,6 +97,7 @@ export const DEFAULT_SETTINGS: SecureGitSettings = {
   lastSyncAt: "",
   lastSyncSummary: "",
   noteBlockIndex: {},
+  noteFileCache: {},
 };
 
 export interface NoteBlockRecord {
@@ -108,6 +112,15 @@ export interface NoteFileBlockIndex {
   blocks: NoteBlockRecord[];
   deletedBlocks?: NoteBlockRecord[];
   updatedAt: string;
+}
+
+export interface NoteFileCacheEntry extends NoteFileBlockIndex {
+  hash: string;
+  size: number;
+  mtimeMs: number;
+  objectPath: string;
+  contentUpdatedAt?: string;
+  pathUpdatedAt?: string;
 }
 
 export interface GitRunResult {

@@ -63,6 +63,11 @@ const TEXT = {
     remove: "Remove",
     addRemote: "Add remote",
     addRemoteDesc: "All remotes share the current vault's single local .git repository.",
+    importLocalRemotes: "Use existing local Git config",
+    importLocalRemotesDesc: "Read remotes from this vault's existing .git/config and reuse them without rewriting their URLs.",
+    importedLocalRemotes: "Imported local Git remotes",
+    noLocalRemotesFound: "No supported local Git remotes were found.",
+    localGitConfigRemote: "Local .git config",
     add: "Add",
     providerAccounts: "Provider accounts",
     browse: "Browse",
@@ -275,6 +280,11 @@ const TEXT = {
     remove: "移除",
     addRemote: "添加远程仓库",
     addRemoteDesc: "所有远程仓库都写入当前 vault 的同一个本地 .git 仓库。",
+    importLocalRemotes: "使用现有本地 Git 配置",
+    importLocalRemotesDesc: "读取当前 vault 已有 .git/config 中的远程仓库，并复用它们而不重写 URL。",
+    importedLocalRemotes: "已导入本地 Git 远程仓库",
+    noLocalRemotesFound: "没有找到支持的本地 Git 远程仓库。",
+    localGitConfigRemote: "本地 .git 配置",
     add: "添加",
     providerAccounts: "平台账号",
     browse: "浏览",
@@ -631,6 +641,18 @@ export default class SecureGitSyncPlugin extends Plugin {
     this.settings.activeRemoteId ||= remote.id;
     await this.saveSettings();
     await this.git.ensureRemote(remote);
+  }
+
+  async importLocalRemotes(): Promise<number> {
+    const localRemotes = await this.git.listLocalRemotes();
+    for (const remote of localRemotes) {
+      const existing = this.settings.remotes.find((item) => item.name === remote.name);
+      await this.addRemote({
+        ...remote,
+        id: existing?.id ?? randomId(),
+      });
+    }
+    return localRemotes.length;
   }
 
   getActiveRemote(): RemoteConfig | null {
@@ -1455,9 +1477,13 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
       .setHeading();
 
     for (const remote of this.plugin.settings.remotes) {
+      const urlCount = remote.urlCount && remote.urlCount > 1 ? ` (${remote.urlCount} URLs)` : "";
+      const remoteDesc = remote.useLocalGitConfig
+        ? `${remote.url}${urlCount} - ${t(language, "localGitConfigRemote")}`
+        : remote.url;
       new Setting(containerEl)
         .setName(`${remote.name} -> ${remote.branch}`)
-        .setDesc(remote.url)
+        .setDesc(remoteDesc)
         .addButton((button) => button
           .setButtonText(remote.id === this.plugin.settings.activeRemoteId ? t(language, "active") : t(language, "use"))
           .setDisabled(remote.id === this.plugin.settings.activeRemoteId)
@@ -1485,6 +1511,21 @@ class SecureGitSyncSettingTab extends PluginSettingTab {
             this.display();
           }));
     }
+
+    new Setting(containerEl)
+      .setName(t(language, "importLocalRemotes"))
+      .setDesc(t(language, "importLocalRemotesDesc"))
+      .addButton((button) => button
+        .setButtonText(t(language, "use"))
+        .onClick(async () => {
+          try {
+            const count = await this.plugin.importLocalRemotes();
+            new Notice(count > 0 ? `${t(language, "importedLocalRemotes")}: ${count}` : t(language, "noLocalRemotesFound"));
+            this.display();
+          } catch (error) {
+            new Notice(formatError(error));
+          }
+        }));
 
     new Setting(containerEl)
       .setName(t(language, "addRemote"))

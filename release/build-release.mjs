@@ -18,10 +18,18 @@ async function main() {
   const outputDir = path.join(scriptDir, releaseName);
   const zipPath = path.join(scriptDir, `${releaseName}.zip`);
   const checksumPath = path.join(scriptDir, `${releaseName}.sha256`);
+  const skipZip = process.argv.includes("--skip-zip");
+
+  await fs.rm(outputDir, { recursive: true, force: true });
+  await fs.mkdir(outputDir, { recursive: true });
 
   if (!process.argv.includes("--skip-build")) {
     const result = spawnSync(process.execPath, ["esbuild.config.mjs", "production"], {
       cwd: rootDir,
+      env: {
+        ...process.env,
+        SECURE_GIT_SYNC_OUTFILE: path.join(outputDir, "main.js"),
+      },
       stdio: "inherit",
     });
     if (result.status !== 0) {
@@ -29,14 +37,16 @@ async function main() {
     }
   }
 
-  await fs.rm(outputDir, { recursive: true, force: true });
+  await fs.writeFile(path.join(outputDir, "manifest.json"), `${JSON.stringify(releaseManifest, null, 2)}\n`, "utf8");
+  await fs.copyFile(path.join(rootDir, "styles.css"), path.join(outputDir, "styles.css"));
+
+  if (skipZip) {
+    console.log(`Build folder: ${path.relative(rootDir, outputDir)}`);
+    return;
+  }
+
   await fs.rm(zipPath, { force: true });
   await fs.rm(checksumPath, { force: true });
-  await fs.mkdir(outputDir, { recursive: true });
-
-  await fs.writeFile(path.join(outputDir, "manifest.json"), `${JSON.stringify(releaseManifest, null, 2)}\n`, "utf8");
-  await fs.copyFile(path.join(rootDir, "main.js"), path.join(outputDir, "main.js"));
-  await fs.copyFile(path.join(rootDir, "styles.css"), path.join(outputDir, "styles.css"));
 
   const zipEntries = [];
   for (const file of files) {
