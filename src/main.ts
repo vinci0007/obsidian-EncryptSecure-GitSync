@@ -60,6 +60,10 @@ const TEXT = {
     verifyAfterSyncDesc: "Off by default for speed. When enabled, each encrypted sync fetches the remote snapshot again and compares all local note hashes.",
     verifyNow: "Verify now",
     progressTimingSummary: "Timing",
+    progressRunning: "Running",
+    progressDone: "Done",
+    progressFailed: "Failed",
+    progressInfo: "Info",
     conflictRetentionDays: "Conflict copy retention",
     conflictRetentionDaysDesc: "Days to keep conflict copies. Use 0 to keep them forever.",
     remotes: "Remotes",
@@ -296,6 +300,10 @@ const TEXT = {
     verifyAfterSyncDesc: "默认关闭以提升速度。开启后，每次加密同步都会再次拉取远端快照并对比全部本地笔记 hash。",
     verifyNow: "立即校验",
     progressTimingSummary: "耗时",
+    progressRunning: "进行中",
+    progressDone: "已完成",
+    progressFailed: "失败",
+    progressInfo: "信息",
     conflictRetentionDays: "冲突副本保留时间",
     conflictRetentionDaysDesc: "冲突副本保留天数。填 0 表示永久保留。",
     remotes: "远程仓库",
@@ -1601,9 +1609,16 @@ export default class SecureGitSyncPlugin extends Plugin {
   private handleGitProgress(event: GitProgressEvent): void {
     const language = this.language();
     const phaseKey = `${event.phase}Phase` as TextKey;
+    const prefix = event.kind === "start"
+      ? this.text("progressRunning")
+      : event.kind === "info"
+        ? this.text("progressInfo")
+        : event.message.includes("(failed)")
+          ? this.text("progressFailed")
+          : this.text("progressDone");
     const line = event.elapsedMs === undefined
-      ? `${t(language, phaseKey)}: ${event.message}`
-      : `${t(language, phaseKey)}: ${event.message} (${formatDuration(event.elapsedMs)})`;
+      ? `${prefix} ${t(language, phaseKey)}: ${event.message}`
+      : `${prefix} ${t(language, phaseKey)}: ${event.message} (${formatDuration(event.elapsedMs)})`;
     const details = [...this.operationState.details];
     if (event.kind === "end" || event.kind === "info") {
       details.push(line);

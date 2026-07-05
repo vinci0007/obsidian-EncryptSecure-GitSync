@@ -1209,18 +1209,19 @@ export class GitService {
       if (settings.syncKeyringToRemote && credential && settings.password) {
         await timed("crypto", "write remote keyring", () => this.writeRemoteKeyring(tempRepo, settings.password!), onProgress);
       }
-      await this.addNewBlobToIndex(tempRepo, MANIFEST_PATH, await encryptJson(nextManifest, key, MANIFEST_AAD));
-      await this.addShardedManifestToIndex(tempRepo, nextManifest, key);
+      await timed("crypto", "write encrypted manifest", async () => {
+        await this.addNewBlobsToIndex(tempRepo, await this.encryptedManifestBlobs(nextManifest, key));
+      }, onProgress);
 
-      const tree = (await this.gitTextAt(tempRepo, ["write-tree"])).trim();
+      const tree = await timed("git", "write encrypted snapshot tree", async () => (await this.gitTextAt(tempRepo, ["write-tree"])).trim(), onProgress);
       const parentArgs = hasRemote ? ["-p", "FETCH_HEAD"] : [];
-      const commit = (await this.gitTextAt(tempRepo, [
+      const commit = await timed("git", "create encrypted snapshot commit", async () => (await this.gitTextAt(tempRepo, [
         "commit-tree",
         tree,
         ...parentArgs,
         "-m",
         renderCommitMessage(settings.commitMessageTemplate),
-      ])).trim();
+      ])).trim(), onProgress);
       await timed("network", `push encrypted snapshot to ${remote.name}/${remote.branch}`, () => this.gitAt(tempRepo, ["push", remote.name, `${commit}:refs/heads/${remote.branch}`], null, authEnv), onProgress);
 
       return { changed, reused, skipped: false };
@@ -1369,11 +1370,11 @@ export class GitService {
       if (!hasRemote) {
         return false;
       }
-      if (await this.treeHasPath(tempRepo, "FETCH_HEAD", MANIFEST_PATH, authEnv)) {
+      if (await this.treeHasPath(tempRepo, "FETCH_HEAD", MANIFEST_INDEX_PATH, authEnv) || await this.treeHasPath(tempRepo, "FETCH_HEAD", MANIFEST_PATH, authEnv)) {
         return true;
       }
       await this.tryGitAt(tempRepo, ["fetch", remote.name, remote.branch], authEnv);
-      return this.treeHasPath(tempRepo, "FETCH_HEAD", MANIFEST_PATH, authEnv);
+      return await this.treeHasPath(tempRepo, "FETCH_HEAD", MANIFEST_INDEX_PATH, authEnv) || await this.treeHasPath(tempRepo, "FETCH_HEAD", MANIFEST_PATH, authEnv);
     } finally {
       await removeTempRepo(tempRepo);
     }
@@ -1596,31 +1597,45 @@ export class GitService {
     }
   }
 
-  private async addShardedManifestToIndex(tempRepo: string, manifest: EncryptedManifest, key: CryptoKey): Promise<void> {
+  private async encryptedManifestBlobs(manifest: EncryptedManifest, key: CryptoKey): Promise<NewIndexBlob[]> {
     const shards = manifestShards(manifest.files);
     const shardRefs: EncryptedManifestShardRef[] = [];
-    for (const shard of shards) {
+    const shardBlobs = await mapLimit(shards, NOTE_PROCESS_CONCURRENCY, async (shard) => {
       const shardPath = `${MANIFEST_SHARD_DIR}/${shard.id}.enc`;
       const payload: EncryptedManifestShard = {
         version: 1,
         files: shard.files,
       };
-      await this.addNewBlobToIndex(tempRepo, shardPath, await encryptJson(payload, key, `${MANIFEST_SHARD_AAD}/${shard.id}`));
       shardRefs.push({
         id: shard.id,
         path: shardPath,
         files: Object.keys(shard.files).length,
       });
-    }
+      return {
+        file: shardPath,
+        contents: await encryptJson(payload, key, `${MANIFEST_SHARD_AAD}/${shard.id}`),
+      };
+    });
 
     const index: EncryptedManifestIndex = {
       version: 3,
       crypto: manifest.crypto,
       tombstones: manifest.tombstones,
       plaintext: manifest.plaintext,
-      shards: shardRefs,
+      shards: shardRefs.sort((left, right) => left.id.localeCompare(right.id)),
     };
-    await this.addNewBlobToIndex(tempRepo, MANIFEST_INDEX_PATH, await encryptJson(index, key, MANIFEST_INDEX_AAD));
+    const legacyManifest = compactLegacyManifest(manifest);
+    return [
+      {
+        file: MANIFEST_PATH,
+        contents: await encryptJson(legacyManifest, key, MANIFEST_AAD),
+      },
+      ...shardBlobs,
+      {
+        file: MANIFEST_INDEX_PATH,
+        contents: await encryptJson(index, key, MANIFEST_INDEX_AAD),
+      },
+    ];
   }
 
   private async readRemoteManifestWithFallback(
@@ -2918,6 +2933,21 @@ function emptyPlaintextSnapshot(): EncryptedPlaintextSnapshot {
   return {
     obsidianHash: sha256Hex(JSON.stringify({})),
     obsidianFiles: {},
+  };
+}
+
+function compactLegacyManifest(manifest: EncryptedManifest): EncryptedManifest {
+  const files: Record<string, EncryptedManifestFile> = {};
+  for (const [file, entry] of Object.entries(manifest.files)) {
+    const { blocks, deletedBlocks, ...compactEntry } = entry;
+    files[file] = compactEntry;
+  }
+  return {
+    version: manifest.version,
+    crypto: manifest.crypto,
+    files,
+    tombstones: manifest.tombstones,
+    plaintext: manifest.plaintext,
   };
 }
 
