@@ -1,0 +1,263 @@
+.secure-git-sync-panel .secure-git-sync-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+
+.secure-git-sync-panel .secure-git-sync-status-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.secure-git-sync-panel .secure-git-sync-status-icon.secure-git-sync-status-running {
+  color: var(--text-accent);
+}
+
+.secure-git-sync-panel .secure-git-sync-status-icon.secure-git-sync-status-completed {
+  color: var(--text-success, var(--color-green));
+}
+
+.secure-git-sync-panel .secure-git-sync-status-icon.secure-git-sync-status-failed {
+  color: var(--text-error, var(--color-red));
+}
+
+.secure-git-sync-panel .secure-git-sync-status-text {
+  font-weight: 600;
+}
+
+.secure-git-sync-panel .secure-git-sync-status-details {
+  white-space: pre-wrap;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.secure-git-sync-panel .secure-git-sync-unlock,
+.secure-git-sync-panel .secure-git-sync-last-sync,
+.secure-git-sync-panel .secure-git-sync-conflicts p {
+  margin: 2px 0 10px;
+  color: var(--text-muted);
+}
+
+.secure-git-sync-panel .secure-git-sync-conflicts {
+  margin-bottom: 10px;
+}
+
+.secure-git-sync-conflict-paths {
+  max-height: 96px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+}
+
+.secure-git-sync-diff-samples {
+  max-height: 120px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+}
+
+.secure-git-sync-resolver-modal {
+  width: min(1440px, 98vw);
+}
+
+.secure-git-sync-resolver {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 50vh;
+  overflow: auto;
+  padding: 2px;
+}
+
+.secure-git-sync-resolver-actions {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 8px 0;
+  padding: 6px 0;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.secure-git-sync-resolver-actions .setting-item {
+  padding: 4px 0;
+  border: 0;
+}
+
+.secure-git-sync-resolver-actions .setting-item-control {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.secure-git-sync-resolver-actions button,
+.secure-git-sync-diff-controls button {
+  height: auto;
+  min-height: 28px;
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.secure-git-sync-live-editors {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.secure-git-sync-live-editor-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 4px;
+}
+
+.secure-git-sync-live-editor-label {
+  font-size: var(--font-ui-smaller);
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.secure-git-sync-live-editor-desc {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.secure-git-sync-live-editor,
+.secure-git-sync-resolver-preview {
+  width: 100%;
+  min-height: 160px;
+  margin: 0;
+  padding: 10px;
+  resize: vertical;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+}
+
+.secure-git-sync-live-editor-result-panel .secure-git-sync-resolver-preview {
+  border-color: var(--interactive-accent);
+}
+
+.secure-git-sync-diff-block {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px minmax(0, 1fr);
+  gap: 8px;
+  align-items: stretch;
+}
+
+.secure-git-sync-diff-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px minmax(0, 1fr);
+  gap: 8px;
+  padding: 4px 0;
+  background: var(--background-primary);
+}
+
+.secure-git-sync-diff-header-cell {
+  font-size: var(--font-ui-smaller);
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.secure-git-sync-diff-side {
+  min-height: 44px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  white-space: pre-wrap;
+  overflow: auto;
+  outline: none;
+  cursor: text;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.secure-git-sync-diff-side:focus {
+  border-color: var(--interactive-accent);
+  box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+
+.secure-git-sync-inline-change {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--text-accent) 22%, transparent);
+  color: var(--text-normal);
+}
+
+.secure-git-sync-diff-change .secure-git-sync-diff-local {
+  border-left: 3px solid var(--color-yellow);
+}
+
+.secure-git-sync-diff-change .secure-git-sync-diff-remote {
+  border-left: 3px solid var(--text-accent);
+}
+
+.secure-git-sync-choice-local .secure-git-sync-diff-local,
+.secure-git-sync-choice-both .secure-git-sync-diff-local {
+  background: var(--background-modifier-success, var(--background-secondary));
+  outline: 1px solid var(--text-success, var(--color-green));
+}
+
+.secure-git-sync-choice-remote .secure-git-sync-diff-remote,
+.secure-git-sync-choice-both .secure-git-sync-diff-remote {
+  background: var(--background-modifier-hover);
+  outline: 1px solid var(--text-accent);
+}
+
+.secure-git-sync-diff-controls {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+}
+
+.secure-git-sync-diff-controls button {
+  width: 100%;
+  font-size: var(--font-ui-smaller);
+}
+
+.secure-git-sync-diff-result {
+  min-height: 40px;
+  width: 100%;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  resize: vertical;
+  white-space: pre-wrap;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.secure-git-sync-resolver-status {
+  margin: 0 0 8px;
+  color: var(--text-accent);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+}

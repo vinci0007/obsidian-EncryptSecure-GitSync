@@ -199,6 +199,19 @@ const TEXT = {
     failed: "Failed",
     operationStarted: "Started",
     operationBusy: "Another operation is already running.",
+    forceStopGit: "Force stop",
+    forceStopRequested: "Force stop requested",
+    stoppedGitProcesses: "Stopped Git processes",
+    removedInternalLocks: "Removed internal lock files",
+    removedOperationLocks: "Removed operation locks",
+    internalLocksRecovered: "Recovered internal Git lock files",
+    staleOperationLocksRecovered: "Recovered stale operation locks",
+    rootGitLockDetected: "Main vault Git lock detected. Close other Git tools before running Git operations, or clear it manually only when no other Git process is running.",
+    rebuildInternalGitCache: "Rebuild internal Git cache",
+    rebuiltInternalGitCache: "Internal Git cache rebuilt",
+    clearRootGitLock: "Clear root Git lock",
+    clearedRootGitLock: "Cleared root Git lock",
+    noRootGitLock: "No root Git lock found.",
     statusLoaded: "Git status loaded.",
     syncCompleted: "Sync completed",
     pullCompleted: "Pull completed",
@@ -439,6 +452,19 @@ const TEXT = {
     failed: "失败",
     operationStarted: "已开始",
     operationBusy: "已有操作正在执行。",
+    forceStopGit: "强制停止",
+    forceStopRequested: "已请求强制停止",
+    stoppedGitProcesses: "已停止 Git 进程",
+    removedInternalLocks: "已清理内部锁文件",
+    removedOperationLocks: "已清理操作锁",
+    internalLocksRecovered: "已恢复内部 Git 锁文件",
+    staleOperationLocksRecovered: "已恢复过期操作锁",
+    rootGitLockDetected: "检测到主 vault Git 锁。请先关闭其他 Git 工具；只有确认没有其他 Git 进程运行时，才手动清理它。",
+    rebuildInternalGitCache: "重建内部 Git 缓存",
+    rebuiltInternalGitCache: "内部 Git 缓存已重建",
+    clearRootGitLock: "清理根仓库 Git 锁",
+    clearedRootGitLock: "根仓库 Git 锁已清理",
+    noRootGitLock: "未发现根仓库 Git 锁。",
     statusLoaded: "Git 状态已加载。",
     syncCompleted: "同步完成",
     pullCompleted: "拉取完成",
@@ -1103,6 +1129,79 @@ export default class SecureGitSyncPlugin extends Plugin {
     return this.git.status();
   }
 
+  async forceStopOperation(): Promise<void> {
+    try {
+      const result = await this.git.forceStopGitWork();
+      const line = `${this.text("stoppedGitProcesses")}: ${result.stoppedProcesses}. ${this.text("removedInternalLocks")}: ${result.removedLockFiles}. ${this.text("removedOperationLocks")}: ${result.removedOperationLocks}.`;
+      const details = [...this.operationState.details, line].slice(-10);
+      this.setOperationState({
+        ...this.operationState,
+        kind: this.operationRunning ? this.operationState.kind : "completed",
+        message: this.operationRunning ? `${this.text("forceStopRequested")}. ${line}` : line,
+        finishedAt: this.operationRunning ? this.operationState.finishedAt : Date.now(),
+        details,
+      });
+      new Notice(line);
+    } catch (error) {
+      const message = formatError(error);
+      this.setOperationState({
+        ...this.operationState,
+        kind: "failed",
+        message,
+        finishedAt: Date.now(),
+      });
+      new Notice(message);
+    }
+  }
+
+  async rebuildInternalGitCache(): Promise<void> {
+    try {
+      const result = await this.git.rebuildInternalGitCache();
+      const line = `${this.text("rebuiltInternalGitCache")}. ${this.text("stoppedGitProcesses")}: ${result.stoppedProcesses}. ${this.text("removedInternalLocks")}: ${result.removedLockFiles}. ${this.text("removedOperationLocks")}: ${result.removedOperationLocks}.`;
+      this.setOperationState({
+        ...this.operationState,
+        kind: "completed",
+        message: line,
+        finishedAt: Date.now(),
+        details: [...this.operationState.details, line].slice(-10),
+      });
+      new Notice(line);
+    } catch (error) {
+      const message = formatError(error);
+      this.setOperationState({
+        ...this.operationState,
+        kind: "failed",
+        message,
+        finishedAt: Date.now(),
+      });
+      new Notice(message);
+    }
+  }
+
+  async clearRootGitLock(): Promise<void> {
+    try {
+      const removed = await this.git.clearRootGitIndexLock();
+      const line = removed > 0 ? this.text("clearedRootGitLock") : this.text("noRootGitLock");
+      this.setOperationState({
+        ...this.operationState,
+        kind: "completed",
+        message: line,
+        finishedAt: Date.now(),
+        details: [...this.operationState.details, line].slice(-10),
+      });
+      new Notice(line);
+    } catch (error) {
+      const message = formatError(error);
+      this.setOperationState({
+        ...this.operationState,
+        kind: "failed",
+        message,
+        finishedAt: Date.now(),
+      });
+      new Notice(message);
+    }
+  }
+
   async runStatusOperation(): Promise<void> {
     if (this.operationRunning) {
       new Notice(this.text("operationBusy"));
@@ -1112,6 +1211,7 @@ export default class SecureGitSyncPlugin extends Plugin {
     this.operationRunning = true;
     this.operationPhaseTotals = new Map();
     const startedAt = Date.now();
+    let operationGuard: Awaited<ReturnType<GitService["beginOperation"]>> | null = null;
     this.setOperationState({
       kind: "running",
       message: `${this.text("operationStarted")}: ${this.text("status")}`,
@@ -1120,6 +1220,8 @@ export default class SecureGitSyncPlugin extends Plugin {
     });
 
     try {
+      operationGuard = await this.git.beginOperation("status");
+      this.reportGitOperationPreparation(operationGuard);
       const status = (await this.gitStatus()).trim() || this.text("workingTreeClean");
       const summary = `${this.text("statusLoaded")} ${this.text("elapsed")}: ${formatDuration(Date.now() - startedAt)}. ${status}`;
       this.setOperationState({
@@ -1141,6 +1243,7 @@ export default class SecureGitSyncPlugin extends Plugin {
       });
       new Notice(message);
     } finally {
+      await operationGuard?.release();
       this.operationRunning = false;
     }
   }
@@ -1151,6 +1254,25 @@ export default class SecureGitSyncPlugin extends Plugin {
       details: [...this.operationState.details],
       conflictDirs: [...(this.operationState.conflictDirs ?? [])],
     };
+  }
+
+  private reportGitOperationPreparation(result: Awaited<ReturnType<GitService["beginOperation"]>>): void {
+    const details = [...this.operationState.details];
+    if (result.removedStaleOperationLocks > 0) {
+      details.push(`${this.text("staleOperationLocksRecovered")}: ${result.removedStaleOperationLocks}`);
+    }
+    if (result.removedInternalLockFiles > 0) {
+      details.push(`${this.text("internalLocksRecovered")}: ${result.removedInternalLockFiles}`);
+    }
+    if (result.rootLockExists) {
+      details.push(this.text("rootGitLockDetected"));
+    }
+    if (details.length !== this.operationState.details.length) {
+      this.setOperationState({
+        ...this.operationState,
+        details: details.slice(-10),
+      });
+    }
   }
 
   subscribeOperationState(listener: () => void): () => void {
@@ -1483,6 +1605,7 @@ export default class SecureGitSyncPlugin extends Plugin {
 
     this.operationRunning = true;
     const startedAt = Date.now();
+    let operationGuard: Awaited<ReturnType<GitService["beginOperation"]>> | null = null;
     this.setOperationState({
       kind: "running",
       message: `${this.text("operationStarted")}: ${this.text(mode)}`,
@@ -1491,6 +1614,8 @@ export default class SecureGitSyncPlugin extends Plugin {
     });
 
     try {
+      operationGuard = await this.git.beginOperation(mode);
+      this.reportGitOperationPreparation(operationGuard);
       const key = this.unlockSession?.key ?? null;
       let cryptoKey = key;
       const credential = await this.buildOperationCredential();
@@ -1599,6 +1724,7 @@ export default class SecureGitSyncPlugin extends Plugin {
       });
       new Notice(message);
     } finally {
+      await operationGuard?.release();
       this.operationRunning = false;
       if (this.unlockSession?.oneTime && !activeDocument.querySelector<HTMLElement>(".secure-git-sync-panel")) {
         this.unlockSession = null;
@@ -2184,6 +2310,7 @@ class OperationPanelModal extends Modal {
   private durationDropdown: DropdownComponent | null = null;
   private unsubscribe = (): void => {};
   private actionButtons: ButtonComponent[] = [];
+  private stopButton: ButtonComponent | null = null;
 
   constructor(
     app: App,
@@ -2233,6 +2360,27 @@ class OperationPanelModal extends Modal {
         this.actionButtons.push(button);
       });
     }
+    ops.addButton((button) => {
+      button
+        .setButtonText(t(this.language, "forceStopGit"))
+        .setWarning()
+        .onClick(() => {
+          void this.plugin.forceStopOperation();
+        });
+      this.stopButton = button;
+    });
+    ops.addButton((button) => button
+      .setButtonText(t(this.language, "rebuildInternalGitCache"))
+      .setWarning()
+      .onClick(() => {
+        void this.plugin.rebuildInternalGitCache();
+      }));
+    ops.addButton((button) => button
+      .setButtonText(t(this.language, "clearRootGitLock"))
+      .setWarning()
+      .onClick(() => {
+        void this.plugin.clearRootGitLock();
+      }));
 
     this.contentEl.createEl("h3", { text: t(this.language, "autoSync") });
 
@@ -2323,6 +2471,7 @@ class OperationPanelModal extends Modal {
     if (this.durationDropdown !== null) {
       this.durationDropdown.setDisabled(running);
     }
+    this.stopButton?.setDisabled(false);
   }
 
   private renderConflicts(state: OperationState): void {
@@ -3479,10 +3628,23 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 function formatError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("Git operation was force stopped.")) {
+    return "Git operation was force stopped.";
+  }
+  if (message.includes("Git command timed out")) {
+    return message;
+  }
+  if (message.includes("internal Git cache") || message.includes("main vault Git repository is locked")) {
+    return message;
+  }
+  if (message.includes("index.lock") && (message.includes("File exists") || message.includes("Unable to create"))) {
+    return "Git lock file exists. Use Force stop, Rebuild internal Git cache, or clear the root Git lock after confirming no other Git process is running.";
+  }
   if (error instanceof Error) {
     return error.message;
   }
-  return String(error);
+  return message;
 }
 
 function formatCredentialError(error: unknown, language: UiLanguage): string {

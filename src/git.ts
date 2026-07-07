@@ -1,4 +1,4 @@
-import { execFile } from "child_process";
+import { ChildProcess, execFile } from "child_process";
 import { randomUUID } from "crypto";
 import { promises as fs } from "fs";
 import * as os from "os";
@@ -16,8 +16,11 @@ const MANIFEST_INDEX_AAD = `${SECURE_DIR}/manifest-index`;
 const MANIFEST_SHARD_DIR = `${SECURE_DIR}/manifest-shards`;
 const MANIFEST_SHARD_AAD = `${SECURE_DIR}/manifest-shard`;
 const KEYRING_PATH = `${SECURE_DIR}/keyring.json`;
+const RUNTIME_DIR = `${SECURE_DIR}/runtime`;
+const OPERATION_LOCK_PATH = `${RUNTIME_DIR}/operation.lock`;
 const NOTE_PROCESS_CONCURRENCY = 6;
 const MANIFEST_SHARD_COUNT = 16;
+const OPERATION_LOCK_STALE_MS = 30 * 60 * 1000;
 const DEFAULT_SYNC_RESOLUTION: SyncConflictResolution = {
   notes: "merge",
   obsidian: "merge",
@@ -104,6 +107,32 @@ interface NewIndexBlob {
   file: string;
   contents: Buffer;
 }
+
+interface ForceStopResult {
+  stoppedProcesses: number;
+  removedLockFiles: number;
+  removedOperationLocks: number;
+}
+
+interface GitOperationGuard {
+  removedInternalLockFiles: number;
+  removedStaleOperationLocks: number;
+  rootLockExists: boolean;
+  release: () => Promise<void>;
+}
+
+interface RebuildGitCacheResult extends ForceStopResult {
+  removedCache: boolean;
+}
+
+interface ActiveGitProcess {
+  child: ChildProcess;
+  cwd: string;
+  args: string[];
+  stopReason: "force" | "timeout" | null;
+}
+
+const ACTIVE_GIT_PROCESSES = new Set<ActiveGitProcess>();
 
 interface EncryptedPlaintextSnapshot {
   obsidianHash?: string;
@@ -233,6 +262,45 @@ export class GitService {
   constructor(vaultPath: string, configDir: string) {
     this.vaultPath = path.resolve(vaultPath);
     this.configDir = normalizeVaultPath(configDir);
+  }
+
+  async beginOperation(operation: string): Promise<GitOperationGuard> {
+    const lock = await acquireOperationLock(this.vaultPath, operation);
+    const removedInternalLockFiles = await recoverInternalGitLockFiles(this.vaultPath);
+    return {
+      removedInternalLockFiles,
+      removedStaleOperationLocks: lock.removedStaleOperationLocks,
+      rootLockExists: await rootGitIndexLockExists(this.vaultPath),
+      release: lock.release,
+    };
+  }
+
+  async forceStopGitWork(): Promise<ForceStopResult> {
+    const ownsProcess = (process: ActiveGitProcess) => isWithinRootPath(this.vaultPath, process.cwd);
+    const stoppedProcesses = stopActiveGitProcesses(ownsProcess);
+    await waitForActiveGitProcessesToExit(ownsProcess, 2000);
+    const removedLockFiles = await removeInternalGitLockFiles(this.vaultPath);
+    const removedOperationLocks = await removeOperationLock(this.vaultPath);
+    return { stoppedProcesses, removedLockFiles, removedOperationLocks };
+  }
+
+  async rebuildInternalGitCache(): Promise<RebuildGitCacheResult> {
+    const stopped = await this.forceStopGitWork();
+    const cacheRoot = resolveVaultPath(this.vaultPath, `${SECURE_DIR}/git-cache`);
+    const removedCache = await exists(cacheRoot);
+    if (removedCache) {
+      await fs.rm(cacheRoot, { recursive: true, force: true });
+    }
+    return { ...stopped, removedCache };
+  }
+
+  async clearRootGitIndexLock(): Promise<number> {
+    const lockPath = resolveVaultPath(this.vaultPath, ".git/index.lock");
+    if (!(await exists(lockPath))) {
+      return 0;
+    }
+    await fs.rm(lockPath, { force: true });
+    return 1;
   }
 
   async ensureRepository(): Promise<void> {
@@ -2263,7 +2331,7 @@ export class GitService {
   }
 
   private gitAt(cwd: string, args: string[], input: Buffer | null = null, env?: NodeJS.ProcessEnv): Promise<GitRunResult> {
-    return runGitAt(cwd, args, input, env, [this.vaultPath, os.tmpdir()]);
+    return runGitAtWithInternalLockRecovery(cwd, args, input, env, [this.vaultPath, os.tmpdir()], this.vaultPath);
   }
 }
 
@@ -2503,16 +2571,19 @@ async function createTempGitRepo(vaultPath?: string): Promise<string> {
     ? resolveVaultPath(vaultPath, `${SECURE_DIR}/git-cache`)
     : await fs.mkdtemp(path.join(os.tmpdir(), "secure-git-sync-"));
   const allowedRoots = vaultPath ? [vaultPath, os.tmpdir()] : [os.tmpdir()];
+  const run = (args: string[]) => vaultPath
+    ? runGitAtWithInternalLockRecovery(tempRepo, args, null, undefined, allowedRoots, vaultPath)
+    : runGitAt(tempRepo, args, null, undefined, allowedRoots);
   await fs.mkdir(tempRepo, { recursive: true });
   if (!(await exists(path.join(tempRepo, ".git")))) {
-    await runGitAt(tempRepo, ["init"], null, undefined, allowedRoots);
+    await run(["init"]);
   }
-  await runGitAt(tempRepo, ["config", "user.name", "Secure Git Sync"], null, undefined, allowedRoots);
-  await runGitAt(tempRepo, ["config", "user.email", "secure-git-sync@local"], null, undefined, allowedRoots);
-  await runGitAt(tempRepo, ["read-tree", "--empty"], null, undefined, allowedRoots);
-  const remotes = (await runGitAt(tempRepo, ["remote"], null, undefined, allowedRoots)).stdout.toString("utf8").split(/\r?\n/).filter(Boolean);
+  await run(["config", "user.name", "Secure Git Sync"]);
+  await run(["config", "user.email", "secure-git-sync@local"]);
+  await run(["read-tree", "--empty"]);
+  const remotes = (await run(["remote"])).stdout.toString("utf8").split(/\r?\n/).filter(Boolean);
   for (const remote of remotes) {
-    await runGitAt(tempRepo, ["remote", "remove", remote], null, undefined, allowedRoots);
+    await run(["remote", "remove", remote]);
   }
   return tempRepo;
 }
@@ -2764,6 +2835,35 @@ function parseConflictTimestamp(value: string): number {
   return Date.parse(value.replace(/-(\d{3})Z$/, ".$1Z").replace(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})/, "$1T$2:$3:$4"));
 }
 
+async function runGitAtWithInternalLockRecovery(
+  cwd: string,
+  args: string[],
+  input: Buffer | null,
+  env: NodeJS.ProcessEnv | undefined,
+  allowedRoots: string[],
+  vaultPath: string,
+): Promise<GitRunResult> {
+  try {
+    return await runGitAt(cwd, args, input, env, allowedRoots);
+  } catch (error) {
+    if (!isGitIndexLockError(error)) {
+      throw error;
+    }
+    if (!isInternalGitCachePath(vaultPath, cwd)) {
+      throw new Error("The main vault Git repository is locked. Close other Git tools or use Clear root Git lock only after confirming no other Git process is running.");
+    }
+    await recoverInternalGitLockFiles(vaultPath);
+    try {
+      return await runGitAt(cwd, args, input, env, allowedRoots);
+    } catch (retryError) {
+      if (isGitIndexLockError(retryError)) {
+        throw new Error("The internal Git cache was locked and retry still failed. Use Force stop or Rebuild internal Git cache.");
+      }
+      throw retryError;
+    }
+  }
+}
+
 function runGitAt(
   cwd: string,
   args: string[],
@@ -2773,6 +2873,9 @@ function runGitAt(
 ): Promise<GitRunResult> {
   const safeCwd = validateGitInvocation(cwd, args, allowedRoots);
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let tracked: ActiveGitProcess;
+    const timeoutMs = gitCommandTimeoutMs(args);
     const child = execFile("git", args, {
       cwd: safeCwd,
       env,
@@ -2780,22 +2883,217 @@ function runGitAt(
       maxBuffer: 1024 * 1024 * 50,
       encoding: "buffer",
     }, (error, stdout, stderr) => {
+      ACTIVE_GIT_PROCESSES.delete(tracked);
+      clearTimeout(timeoutId);
+      if (settled) {
+        return;
+      }
+      settled = true;
       const result = {
         stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout),
         stderr: Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr),
       };
       if (error) {
-        reject(new Error(result.stderr.toString("utf8") || error.message));
+        reject(new Error(gitFailureMessage(tracked, args, timeoutMs, result.stderr.toString("utf8") || error.message)));
         return;
       }
       resolve(result);
     });
+    tracked = { child, cwd: safeCwd, args: [...args], stopReason: null };
+    ACTIVE_GIT_PROCESSES.add(tracked);
+    const timeoutId = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      tracked.stopReason = "timeout";
+      child.kill();
+      setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      }, 1000);
+    }, timeoutMs);
+    child.on("error", (error) => {
+      ACTIVE_GIT_PROCESSES.delete(tracked);
+      clearTimeout(timeoutId);
+      if (!settled) {
+        settled = true;
+        reject(new Error(gitFailureMessage(tracked, args, timeoutMs, error.message)));
+      }
+    });
+    child.stdin?.on("error", (error) => {
+      if (tracked.stopReason === null && !settled) {
+        ACTIVE_GIT_PROCESSES.delete(tracked);
+        clearTimeout(timeoutId);
+        settled = true;
+        reject(error);
+      }
+    });
+    child.on("close", () => clearTimeout(timeoutId));
 
     if (input) {
       child.stdin?.write(input);
     }
     child.stdin?.end();
   });
+}
+
+function stopActiveGitProcesses(predicate: (process: ActiveGitProcess) => boolean): number {
+  let stopped = 0;
+  for (const process of Array.from(ACTIVE_GIT_PROCESSES)) {
+    if (!predicate(process) || process.child.killed) {
+      continue;
+    }
+    process.stopReason = "force";
+    process.child.kill();
+    setTimeout(() => {
+      if (!process.child.killed) {
+        process.child.kill("SIGKILL");
+      }
+    }, 1000);
+    stopped += 1;
+  }
+  return stopped;
+}
+
+function gitCommandTimeoutMs(args: string[]): number {
+  const command = args[0] ?? "";
+  if (command === "fetch" || command === "push" || command === "pull") {
+    return 15 * 60 * 1000;
+  }
+  if (command === "hash-object" || command === "cat-file") {
+    return 5 * 60 * 1000;
+  }
+  if (["status", "read-tree", "write-tree", "commit-tree", "update-index", "config", "remote", "ls-tree", "show", "rev-parse"].includes(command)) {
+    return 2 * 60 * 1000;
+  }
+  return 5 * 60 * 1000;
+}
+
+function gitFailureMessage(process: ActiveGitProcess, args: string[], timeoutMs: number, fallback: string): string {
+  if (process.stopReason === "force") {
+    return "Git operation was force stopped.";
+  }
+  if (process.stopReason === "timeout") {
+    return `Git command timed out after ${formatMilliseconds(timeoutMs)}: git ${args.join(" ")}`;
+  }
+  return fallback;
+}
+
+function formatMilliseconds(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  return `${Math.round(seconds / 60)}m`;
+}
+
+async function waitForActiveGitProcessesToExit(predicate: (process: ActiveGitProcess) => boolean, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  while (Array.from(ACTIVE_GIT_PROCESSES).some(predicate) && Date.now() - startedAt < timeoutMs) {
+    await delay(100);
+  }
+}
+
+async function acquireOperationLock(vaultPath: string, operation: string): Promise<{ removedStaleOperationLocks: number; release: () => Promise<void> }> {
+  const lockPath = resolveVaultPath(vaultPath, OPERATION_LOCK_PATH);
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const removedStaleOperationLocks = await removeStaleOperationLock(vaultPath);
+  const payload = {
+    operation,
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+  };
+  try {
+    await fs.writeFile(lockPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if (isFileExistsError(error)) {
+      throw new Error("Secure Git Sync already has an operation lock. Use Force stop if the previous operation is no longer running.");
+    }
+    throw error;
+  }
+  return {
+    removedStaleOperationLocks,
+    release: async () => {
+      await fs.rm(lockPath, { force: true });
+    },
+  };
+}
+
+async function removeStaleOperationLock(vaultPath: string): Promise<number> {
+  const lockPath = resolveVaultPath(vaultPath, OPERATION_LOCK_PATH);
+  try {
+    const stat = await fs.stat(lockPath);
+    if (Date.now() - stat.mtimeMs < OPERATION_LOCK_STALE_MS) {
+      return 0;
+    }
+    await fs.rm(lockPath, { force: true });
+    return 1;
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return 0;
+    }
+    throw error;
+  }
+}
+
+async function removeOperationLock(vaultPath: string): Promise<number> {
+  const lockPath = resolveVaultPath(vaultPath, OPERATION_LOCK_PATH);
+  if (!(await exists(lockPath))) {
+    return 0;
+  }
+  await fs.rm(lockPath, { force: true });
+  return 1;
+}
+
+async function recoverInternalGitLockFiles(vaultPath: string): Promise<number> {
+  if (Array.from(ACTIVE_GIT_PROCESSES).some((process) => isInternalGitCachePath(vaultPath, process.cwd))) {
+    return 0;
+  }
+  return removeInternalGitLockFiles(vaultPath);
+}
+
+async function removeInternalGitLockFiles(vaultPath: string): Promise<number> {
+  const gitDir = resolveVaultPath(vaultPath, `${SECURE_DIR}/git-cache/.git`);
+  if (!(await exists(gitDir))) {
+    return 0;
+  }
+  return removeLockFilesUnder(gitDir);
+}
+
+async function removeLockFilesUnder(root: string): Promise<number> {
+  let removed = 0;
+  for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      removed += await removeLockFilesUnder(fullPath);
+    } else if (entry.isFile() && entry.name.endsWith(".lock")) {
+      await fs.rm(fullPath, { force: true });
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+async function rootGitIndexLockExists(vaultPath: string): Promise<boolean> {
+  return exists(resolveVaultPath(vaultPath, ".git/index.lock"));
+}
+
+function isInternalGitCachePath(vaultPath: string, target: string): boolean {
+  return isWithinRootPath(resolveVaultPath(vaultPath, `${SECURE_DIR}/git-cache`), target);
+}
+
+function isGitIndexLockError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("index.lock") && (message.includes("File exists") || message.includes("Unable to create"));
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "EEXIST";
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 function validateGitInvocation(cwd: string, args: string[], allowedRoots: string[]): string {
